@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity name="Rebound.SA.Direct" version="1.0.0.0" processorArchitecture="x86" type="win32"/>
+  <file name="Rebound.SA.asi">
+    <comClass clsid="{597DEF5E-678B-4808-9D28-AE792436F436}" threadingModel="Both"/>
+  </file>
+</assembly>
