@@ -10,6 +10,7 @@
 - **Reworked Doppler effect.** Pitch changes based on the relative motion of the source and the listener.
 - **Reworked underwater audio.** Submerging applies high-frequency filtering, adjustable attenuation, and modulation. Processing also covers the radio in submerged vehicles.
 - **Low-health effect.** As CJ loses health, high frequencies fade, bass reverberation grows louder and lasts longer, and ringing in his ears intensifies.
+- **Explosion concussion.** Taking damage from an explosion briefly muffles the audio and causes ringing in CJ’s ears. The strength of the effect depends on how close CJ is to the center of the blast and how much damage he takes.
 
 ## Installation and controls
 Move the folder containing the files from the archive into your `modloader` folder or the game directory. By default, **F8** reloads the INI file while the game is running.
