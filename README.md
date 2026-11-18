@@ -9,12 +9,10 @@
 - **Spatial reflections.** First-order Ambisonics helps convey the direction of reflected sound.
 - **Reworked Doppler effect.** Pitch changes based on the relative motion of the source and the listener.
 - **Reworked underwater audio.** Submerging applies high-frequency filtering, adjustable attenuation, and modulation. Processing also covers the radio in submerged vehicles.
-- **Low-health audio.** As CJ loses health, high frequencies fade, bass reverberation grows louder and lasts longer, and ringing in his ears intensifies. Radio, mission dialogue, HUD sounds and environmental echoes share this effect. Recognized CJ voice lines and their usual echoes bypass the injury filter.
+- **Low-health audio.** As CJ loses health, high frequencies fade, bass reverberation grows louder and lasts longer, and ringing in his ears intensifies. Radio, mission dialogue, HUD sounds and environmental echoes share this effect.
 
 ## Installation and controls
 Move the folder containing the files from the archive into your `modloader` folder or the game directory. By default, **F8** reloads the INI file while the game is running.
-
-In `[LowHealth]`, `Enabled` toggles the effect, `ThresholdPercent` sets the starting threshold (10–50% of maximum health, default 15%), and `StrengthPercent` controls its intensity (0–100%, default 100%). Menus and cutscenes keep their usual sound. When CJ dies, the audio fades with the screen.
 
 ## Note
 This plugin was generated entirely using AI.
