@@ -9,7 +9,7 @@
 - **Spatial reflections.** First-order Ambisonics helps convey the direction of reflected sound.
 - **Reworked Doppler effect.** Pitch changes based on the relative motion of the source and the listener.
 - **Reworked underwater audio.** Submerging applies high-frequency filtering, adjustable attenuation, and modulation. Processing also covers the radio in submerged vehicles.
-- **Low-health audio.** As CJ loses health, high frequencies fade, bass reverberation grows louder and lasts longer, and ringing in his ears intensifies. Radio, mission dialogue, HUD sounds and environmental echoes share this effect.
+- **Low-health audio.** As CJ loses health, high frequencies fade, bass reverberation grows louder and lasts longer, and ringing in his ears intensifies.
 
 ## Installation and controls
 Move the folder containing the files from the archive into your `modloader` folder or the game directory. By default, **F8** reloads the INI file while the game is running.
