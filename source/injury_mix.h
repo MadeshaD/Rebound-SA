@@ -1,6 +1,7 @@
 #pragma once
 #include <array>
 #include "low_health.h"
+#include "injury_diffusion.h"
 
 namespace injury {
 constexpr unsigned sdkFrames=128;
@@ -28,14 +29,17 @@ class Program {
     unsigned rate{},cursor{},tailFrames{};
     Tone tone[8], speechTone[8];
     Ring ring;
+    Diffusion diffusion;
+    float blurInput{},blurBand{},blurPole{};
     std::array<float,sdkFrames> input{},returned{};
     float depth{},fade=1,follow{},dc{},body{},body2{},tailLow{},tailHigh{},env{},modeX{},modeY{};
     float hp{},lp{},tailPole{},highPole{},rotX{},rotY{},attack{},release{};
     bool active{},blockExcited{};
 public:
     void configure(unsigned hz){
-        rate=hz;follow=pole(6.f,hz);hp=pole(34.f,hz);lp=pole(790.f,hz);
-        tailPole=pole(530.f,hz);highPole=pole(45.f,hz);
+        rate=hz;follow=pole(1.7f,hz);hp=pole(34.f,hz);lp=pole(790.f,hz);
+        blurPole=pole(1700.f,hz);diffusion.configure(hz);
+        tailPole=pole(920.f,hz);highPole=pole(45.f,hz);
         const float angle=6.283185307f*102.f/hz,damping=std::exp(-1.f/(.085f*hz));
         rotX=damping*std::cos(angle);rotY=damping*std::sin(angle);
         attack=pole(95.f,hz);release=pole(4.f,hz);
@@ -45,7 +49,7 @@ public:
     bool running()const{return active;}
     template<class Reverb> void reset(Reverb& sdk){
         if(active)sdk.clear();
-        active=blockExcited=false;cursor=tailFrames=0;depth=0;fade=1;ring.clear();
+        active=blockExcited=false;cursor=tailFrames=0;depth=0;fade=1;ring.clear();diffusion.clear();blurInput=blurBand=0;
         dc=body=body2=tailLow=tailHigh=env=modeX=modeY=0;
         input.fill(0);returned.fill(0);for(auto& t:tone)t={};for(auto& t:speechTone)t={};
     }
@@ -81,9 +85,12 @@ public:
         float next=rotX*modeX-rotY*modeY+.7f*delta;
         modeY=rotY*modeX+rotX*modeY;modeX=next;
         // A changing programme envelope excites the low mode, including short HUD beeps.
-        float drive=(body2+.55f*modeX)*std::sqrt(std::max(0.f,depth));
-        input[cursor]=drive;
-        blockExcited|=std::abs(drive)>1.e-7f;
+        float drive=(body2+.24f*modeX)*std::sqrt(std::max(0.f,depth));
+        blurInput+=blurPole*(mid-dc-blurInput);
+        blurBand+=blurPole*(blurInput-blurBand);
+        const auto reflection=diffusion.sample(blurBand*depth);
+        input[cursor]=.70f*drive+(.58f+.55f*depth)*reflection.mid;
+        blockExcited|=std::abs(input[cursor])>1.e-7f;
         float wet=returned[cursor];
         if(++cursor==sdkFrames){
             // An empty injury bus stays digitally silent even when the SDK uses
@@ -98,15 +105,16 @@ public:
             cursor=0;blockExcited=false;
         }
         tailLow+=tailPole*(wet-tailLow);tailHigh+=highPole*(tailLow-tailHigh);
-        float raw=(tailLow-tailHigh)*(1.45f+2.6f*depth)+.24f*drive;
+        float raw=(tailLow-tailHigh)*(1.45f+2.6f*depth)+(.28f+.54f*depth)*reflection.mid;
         // Reserve headroom for loud transients, without limiting the normal game mix.
         float rumble=raw/(1.f+std::abs(raw)/.52f);
         if(state.amount==0.f)rumble*=std::min(1.f,depth*12.f);
-        float ears=ring.tick(depth,master,float(rate));
+        float ears=ring.tick(depth,master,float(rate),state.blastRing);
         for(unsigned c=0;c<channels;c++){
             float dry=tone[c].sample(game[c]);
-            float extra=int(c)==lfe?.7f*rumble:(c<2?rumble+ears:.54f*rumble);
-            const float scene=dry*(1.f-.14f*depth)+extra;
+            const float side=(c==0?1.f:-1.f)*reflection.side*depth;
+            float extra=int(c)==lfe?.7f*rumble:(c<2?rumble+ears+(channels>1?side:0.f):.54f*rumble);
+            const float scene=dry*(1.f-.18f*depth)+extra;
             const float voice=speechTone[c].sample(speech[c]);
             game[c]=fade*(depth>.001f?combine(scene,voice):scene+voice);
         }

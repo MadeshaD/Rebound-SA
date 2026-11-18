@@ -32,13 +32,13 @@
 #include "direct_tone.h"
 #include "underwater.h"
 #include "air_path.h"
-#include "low_health.h"
+#include "concussion.h"
 
 namespace healthAudio {
 std::atomic<bool> enabled{true}, cjVoice[64]{};
 std::atomic<int> threshold{15},strength{100};
 std::atomic<float> master{};
-std::atomic<uint32_t> stateWord{};
+std::atomic<uint64_t> stateWord{};
 std::atomic<unsigned> stateVersion{};
 std::atomic<DWORD> updated{};
 // These are process-lifetime flags in the supported game. Checking them at
@@ -48,13 +48,13 @@ bool excluded(){
     return flag(0xBA67A4) || flag(0xB7CB48) || flag(0xB7CB49) || flag(0xB5F851);
 }
 injury::State snapshot(){
-    const uint32_t word=stateWord.load();
-    if(!word || !enabled.load() || GetTickCount()-updated.load()>1500 || excluded())return {};
-    return {(word&65535)/65535.f,((word>>16)&32767)/32767.f,false};
+    const uint64_t word=stateWord.load();
+    if(!word || GetTickCount()-updated.load()>1500 || excluded())return {};
+    return {(word&65535)/65535.f,((word>>16)&32767)/32767.f,false,float(word>>32)/16384.f};
 }
 void publish(injury::State s){
     updated=GetTickCount();
-    uint32_t word=s.bypass?0:0x80000000u|(uint32_t(s.fade*32767.f+.5f)<<16)|uint32_t(s.amount*65535.f+.5f);
+    uint64_t word=s.bypass?0:(uint64_t(s.blastRing*16384.f+.5f)<<32)|0x80000000u|(uint32_t(s.fade*32767.f+.5f)<<16)|uint32_t(s.amount*65535.f+.5f);
     if(bool(stateWord.exchange(word))!=bool(word))++stateVersion;
 }
 }
@@ -1772,6 +1772,41 @@ DWORD WINAPI worker(void*) {
 
 }
 
+injury::Concussion concussion;
+bool explosionHooks{};
+unsigned blastHits{};
+struct ExplosionDamage {
+    uintptr_t player{};
+    float nestedLoss{};
+};
+ExplosionDamage* activeExplosion{}; // Accessed only on the game thread.
+void __cdecl explosionDamage(const Vec& point,float radius,float visible,void* victim,void* creator,bool bomb,float damage){
+    using Trigger=void(__cdecl*)(const Vec&,float,float,void*,void*,bool,float);
+    const auto original=reinterpret_cast<Trigger>(0x56B790);
+    auto player=[](){return reinterpret_cast<uintptr_t(__cdecl*)(int)>(0x56E210)(-1);};
+    if(GetCurrentThreadId()!=gameThread.load() || !concussion.enabled || !concussion.strength || healthAudio::excluded()){
+        original(point,radius,visible,victim,creator,bomb,damage);return;
+    }
+    ExplosionDamage event{player()};
+    if(!event.player){original(point,radius,visible,victim,creator,bomb,damage);return;}
+    const auto vitality=[&](){return read<float>(event.player+0x540)+read<float>(event.player+0x548);};
+    const float before=vitality();
+    Vec position{};reinterpret_cast<void(__cdecl*)(Vec*,int)>(0x56E010)(&position,-1);
+    const float metres=magnitude(difference(position,point));
+    auto* parent=activeExplosion;
+    activeExplosion=&event;
+    original(point,radius,visible,victim,creator,bomb,damage);
+    activeExplosion=parent;
+    if(player()!=event.player)return;
+    const float total=std::max(0.f,before-vitality());
+    if(parent && parent->player==event.player)parent->nestedLoss+=total;
+    const float loss=total-event.nestedLoss;
+    if(loss>0 && metres<concussion.radius){
+        concussion.hit(event.player,read<DWORD>(0xB7CB84),loss,metres);
+        ++blastHits;
+    }
+}
+
 int option(const wchar_t* group,const wchar_t* key,int def,int high,const wchar_t* oldGroup=nullptr){
     constexpr int missing=-32768;
     int value=int(GetPrivateProfileIntW(group,key,missing,iniPath.c_str()));
@@ -1814,6 +1849,7 @@ void writeStatus(bool force=false){
     std::fprintf(file,"  water enabled=%d listener=%.3f sources=%u radioFiltered=%d steamWater=%d radioChain=%d cutoffHz=%d lossDb=%d modulation=%d\n",
         int(waterEnabled),immersion::listener.load(),submerged,int(directfx::streamWet.load()),int(directfx::ready.load()),int(directfx::streamActive.load()),
         immersion::cutoff.load(),immersion::loss.load(),immersion::modulation.load());
+    std::fprintf(file,"  concussion hook=%d hits=%u intensity=%.3f\n",int(explosionHooks),blastHits,concussion.value(read<DWORD>(0xB7CB84)));
     auto injury=healthAudio::snapshot();
     std::fprintf(file,"  lowHealth enabled=%d threshold=%d strength=%d amount=%.3f deathGain=%.3f bypass=%d outputMix=%d\n",
         int(healthAudio::enabled.load()),healthAudio::threshold.load(),healthAudio::strength.load(),
@@ -1831,7 +1867,7 @@ void loadSettings(){
     if(logging && !wasLogging){
         logPath=iniPath.substr(0,iniPath.size()-4)+L".log";
         if(FILE* file=_wfopen(logPath.c_str(),L"w")){
-            std::fputs("Rebound.SA 0.62\nStatus every 5 seconds. Counters are cumulative for this game session.\n",file);
+            std::fputs("Rebound.SA 0.65\nStatus every 5 seconds. Counters are cumulative for this game session.\n",file);
             std::fclose(file);
         }
     }
@@ -1852,6 +1888,13 @@ void loadSettings(){
     healthAudio::enabled=option(L"LowHealth",L"Enabled",1,1);
     healthAudio::threshold=std::max(10,option(L"LowHealth",L"ThresholdPercent",15,50));
     healthAudio::strength=option(L"LowHealth",L"StrengthPercent",100,100);
+    concussion.enabled=option(L"Concussion",L"Enabled",1,1);
+    concussion.radius=float(std::max(1,option(L"Concussion",L"Radius",18,100)));
+    concussion.fullDamage=float(std::max(1,option(L"Concussion",L"FullDamage",50,200)));
+    concussion.strength=.01f*option(L"Concussion",L"StrengthPercent",100,100);
+    concussion.recovery=float(std::max(1,option(L"Concussion",L"MaxDurationSeconds",8,30)));
+    concussion.ringing=.01f*std::max(100,option(L"Concussion",L"RingingPercent",250,400));
+    if(!concussion.enabled || !concussion.strength)concussion.clear();
     immersion::loss=option(L"Underwater",L"AttenuationDb",0,36);
     immersion::cutoff=std::max(100,option(L"Underwater",L"CutoffHz",420,3000));
     immersion::modulation=option(L"Underwater",L"ModulationPercent",12,35);
@@ -1908,8 +1951,19 @@ void frame() {
     float screenAlpha=read<float>(0xB6F028+0xbfc);
     float sfx=read<float>(hardware+0x414)*read<float>(hardware+0x41c);
     healthAudio::master=std::isfinite(sfx)?std::clamp(sfx,0.f,1.f):0.f;
-    healthAudio::publish(life.update(ped!=0,ped?read<float>(ped+0x540):0.f,ped?read<float>(ped+0x544):0.f,
-        wasted,screenAlpha,healthAudio::threshold,healthAudio::strength,healthAudio::enabled,paused || healthAudio::excluded()));
+    const bool excluded=paused || healthAudio::excluded();
+    const float hp=ped?read<float>(ped+0x540):0.f;
+    static bool wasDead=false;
+    if(!paused){
+        if((ped && concussion.owner!=ped) || (wasDead && ped && hp>0 && !wasted) || excluded)concussion.clear();
+        wasDead=wasted || (ped && hp<=0);
+    }
+    const float impact=concussion.enabled?concussion.value(read<DWORD>(0xB7CB84)):0.f;
+    const bool low=healthAudio::enabled.load() && healthAudio::strength.load()>0;
+    auto state=life.update(ped!=0,hp,ped?read<float>(ped+0x544):0.f,wasted,screenAlpha,
+        healthAudio::threshold,low?healthAudio::strength.load():100,low || impact>0,excluded);
+    if(!low)state.amount=0;
+    healthAudio::publish(concussion.mix(state,impact));
     float targetWater=0;
     if(waterEnabled && ped){
         targetWater=read<float>(0xC8132C)>=.5f?1.f:0.f;
@@ -1988,6 +2042,21 @@ void install(HMODULE mod) {
         HMODULE pinned;
         if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,
                                reinterpret_cast<LPCWSTR>(mod),&pinned)) {
+            // Both original CALLs share one executable page. Install them together.
+            constexpr uintptr_t first=0x7374DA, delayed=0x7376A4;
+            if(matches(first,"\xe8\xb1\x42\xe3\xff\x83\xc4\x1c",8) &&
+               matches(delayed,"\xe8\xe7\x40\xe3\xff\x83\xc4\x1c",8)){
+                auto* page=reinterpret_cast<void*>(first);
+                DWORD saved{};
+                if(VirtualProtect(page,delayed+5-first,PAGE_EXECUTE_READWRITE,&saved)){
+                    for(uintptr_t site:{first,delayed}){
+                        uint32_t offset=uintptr_t(explosionDamage)-(site+5);
+                        memcpy(reinterpret_cast<void*>(site+1),&offset,4);
+                    }
+                    FlushInstructionCache(GetCurrentProcess(),page,delayed+5-first);
+                    VirtualProtect(page,delayed+5-first,saved,&tmp);explosionHooks=true;
+                }
+            }
             constexpr uintptr_t audioCreate=0x4d99f0;
             if(matches(audioCreate,"\xff\x15\x1c\x80\x85\x00\x85\xc0",8)){
                 DWORD protection;auto* site=reinterpret_cast<BYTE*>(audioCreate);

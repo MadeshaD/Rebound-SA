@@ -7,6 +7,7 @@ struct State {
     float amount{};
     float fade{1.f};
     bool bypass{true};
+    float blastRing{};
 };
 
 inline State evaluate(float hp,float maximum,int threshold,int strength,bool enabled,
@@ -47,9 +48,9 @@ struct Tone {
         const float target=std::clamp(amount,0.f,1.f);
         if(initialized && !immediate && mixGoal==target && configuredRate==rate)return;
         configuredRate=rate;mixGoal=target;
-        const float hz=std::min(16000.f,.43f*rate)*std::pow(1.f/40.f,mixGoal);
+        const float hz=std::min(16000.f,.43f*rate)*std::pow(1.f/28.f,mixGoal);
         cutGoal=pole(hz,rate);
-        slew=pole(10.f,rate);
+        slew=pole(1.6f,rate);
         if(immediate || !initialized){mix=mixGoal;cut=cutGoal;initialized=true;}
     }
     float sample(float x){
@@ -57,7 +58,7 @@ struct Tone {
         cut+=slew*(cutGoal-cut);
         first+=cut*(x-first);second+=cut*(first-second);
         // Retain a little attack during the shallow end of the transition.
-        const float blend=std::min(1.f,mix*3.f);
+        const float blend=1.f-(1.f-mix)*(1.f-mix)*(1.f-mix);
         return x+blend*(second-x);
     }
 };
@@ -67,9 +68,9 @@ struct Ring {
     double phase{};
     float gain{};
     void clear(){phase=0;gain=0;}
-    float tick(float amount,float master,float rate){
-        const float goal=.010f*amount*amount*master;
-        gain+=std::min(1.f,1.f/(.035f*rate))*(goal-gain);
+    float tick(float amount,float master,float rate,float blastRing=0.f){
+        const float goal=.010f*std::max(amount*amount,blastRing)*master;
+        gain+=std::min(1.f,1.f/(.13f*rate))*(goal-gain);
         phase+=6.283185307179586*3180./rate;
         if(phase>=6.283185307179586)phase-=6.283185307179586;
         return gain*float(std::sin(phase));
