@@ -18,7 +18,6 @@
 #include <cwchar>
 #include <memory>
 #include <iterator>
-#include <vector>
 #include <new>
 #include "room.h"
 #include "acoustics.h"
@@ -61,6 +60,8 @@ void publish(injury::State s){
 }
 #include "direct_dmo.h"
 #include "speech_buffer.h"
+#include "radio_buffer.h"
+#include "static_water.h"
 #include "endpoint.h"
 #include "speech_playback.h"
 
@@ -88,7 +89,6 @@ constexpr int frames=256;
 #include "early_geometry.h"
 #include "field.h"
 struct Voice {
-    immersion::Filter submergedSource;
     EarlyPaths lastPaths{};
     NearWallDelay nearWall[2]{};
     int wallStretch{};
@@ -222,68 +222,17 @@ float depthAt(Vec p){
     bool hit=reinterpret_cast<bool(__cdecl*)(float,float,float,float*,bool,Vec*)>(0x6EB690)(p.x,p.y,p.z,&surface,true,nullptr);
     return hit?std::clamp((surface-p.z-.12f)/.6f,0.f,1.f):0.f;
 }
-// Apply the game's two streaming EQ stages to samples at playback time.
-constexpr uintptr_t audioHw=0xB5F8B8;
+constexpr uintptr_t hardware=0xB5F8B8;
 bool radioHook{};
-float streamImmersion(){
-    return read<int>(audioHw+0xe14+0x34)==174 ? 0.f : immersion::listener.load();
-}
-std::atomic<float> requestedStreamDb{};
-
-std::atomic<bool> radioFiltered{};
 uintptr_t playerPed{};
-void updateRadio(float wet,bool beforePlay=false){
-    if(!radioHook)return;
-    auto channel=read<uintptr_t>(audioHw+0xe10);
-    if(!channel || !read<uintptr_t>(channel+8)){radioFiltered=false;return;}
-    const int track=read<int>(audioHw+0xe14+0x34);
-    const float radioWet=track!=174?wet:0.f;
-    if(radioWet<.005f){
-        if(radioFiltered){
-            reinterpret_cast<void(__thiscall*)(uintptr_t,int,float)>(0x4f1f30)(
-                channel,read<int>(audioHw+0xd90),read<float>(audioHw+0xd94));
-            radioFiltered=false;
-        }
-        return;
+std::wstring pluginDirectory(){return iniPath.substr(0,iniPath.find_last_of(L"/\\")+1);}
+HRESULT WINAPI createStreamBuffer(IDirectSound* ds,const DSBUFFERDESC* desc,IDirectSoundBuffer** out,IUnknown* outer){
+    HRESULT h=ds->CreateSoundBuffer(desc,out,outer);
+    if(SUCCEEDED(h) && out && *out && !outer && desc->lpwfxFormat && desc->lpwfxFormat->nChannels==2){
+        directfx::start(pluginDirectory());
+        if(directfx::ready)RadioBuffer::wrap(out,desc->lpwfxFormat->nSamplesPerSec);
     }
-    if(!read<BYTE>(channel+0x65) && (beforePlay || !reinterpret_cast<bool(__thiscall*)(uintptr_t)>(0x4f1ae0)(channel)))return;
-    radioFiltered=true;
-    IDirectSoundBuffer8* ext{};
-    auto buffer=read<IDirectSoundBuffer*>(channel+8);
-    if(FAILED(buffer->QueryInterface(IID_IDirectSoundBuffer8,(void**)&ext)))return;
-    for(unsigned i=0;i<2;i++){
-        IDirectSoundFXParamEq* eq{};
-        if(SUCCEEDED(ext->GetObjectInPath(GUID_DSFX_STANDARD_PARAMEQ,i,IID_IDirectSoundFXParamEq,(void**)&eq))){
-            DSFXParamEq tone{std::clamp(float(immersion::cutoff)*(i?14.f:4.f),100.f,16000.f),36.f,-(i?15.f:12.f)*radioWet};
-            eq->SetAllParameters(&tone);eq->Release();
-        }
-    }
-    ext->Release();
-}
-void __fastcall radioVolume(uintptr_t channel,void*,float db){
-    if(channel==read<uintptr_t>(audioHw+0xe10)){
-        requestedStreamDb=db;
-        db=std::max(-100.f,db-streamImmersion()*immersion::loss.load());
-    }
-    reinterpret_cast<void(__thiscall*)(uintptr_t,float)>(0x4d7c60)(channel,db);
-}
-
-// Stream start sets buffer volume directly immediately before Play.
-HRESULT WINAPI startStreamVolume(IDirectSoundBuffer* buffer,LONG nativeLevel){
-    const float wet=streamImmersion();
-    if(wet>.005f){
-        updateRadio(wet,true);
-        LONG limit=LONG(100.f*(requestedStreamDb.load()-wet*immersion::loss.load()));
-        nativeLevel=std::clamp(std::min(nativeLevel,limit),LONG(-10000),LONG(0));
-    }
-    return buffer->SetVolume(nativeLevel);
-}
-
-extern "C" HRESULT __stdcall streamStartNative(IDirectSoundBuffer* b,LONG level){
-    return startStreamVolume(b,level);
-}
-__attribute__((naked)) void startStreamThunk(){
-    asm volatile("push %eax; push %edi; call _streamStartNative@8; ret");
+    return h;
 }
 std::atomic<DWORD> gameThread{0};
 
@@ -544,7 +493,6 @@ int measure() {
 }
 
 constexpr uintptr_t manager=0xB62CB0;
-constexpr uintptr_t hardware=0xB5F8B8;
 bool isPlayerSpeech(uintptr_t sound){
     return playerPed && (read<uintptr_t>(sound+4)==playerPed+0x294 ||
         (read<uintptr_t>(sound+8)==playerPed && isPedSpeech(read<short>(sound),read<unsigned>(sound+0xc))));
@@ -564,14 +512,30 @@ int worldChannel(IDirectSoundBuffer** output){
 
 HRESULT createNativeBuffer(IDirectSound* ds,const DSBUFFERDESC* original,IDirectSoundBuffer** out,IUnknown* outer){
     int slot=worldChannel(out);
+    int physical=-1;
     for(int j=0;j<std::min(64,int(read<unsigned short>(hardware+0x8e)));j++){
         if(read<uintptr_t>(hardware+0xe64+4*j)+8==uintptr_t(out)){
-            directfx::attached[j]=false;
-            immersion::source[j]=0;break;
+            physical=j;
+            directfx::attached[j]=false;directfx::waterAttached[j]=false;
+            immersion::drowning[j]=false;immersion::source[j]=0;break;
         }
     }
-    if(!(original->dwFlags&DSBCAPS_CTRL3D) || slot<0)
+    if(!(original->dwFlags&DSBCAPS_CTRL3D) || slot<0){
+        const auto* fmt=original->lpwfxFormat;
+        if(physical>=0 && directfx::ready && fmt && fmt->nChannels==1 && fmt->nAvgBytesPerSec &&
+           original->dwBufferBytes>=fmt->nAvgBytesPerSec*.150){
+            DSBUFFERDESC desc=*original;
+            desc.dwFlags=(desc.dwFlags&~DSBCAPS_LOCHARDWARE)|DSBCAPS_LOCSOFTWARE|DSBCAPS_CTRLFX;
+            auto h=ds->CreateSoundBuffer(&desc,out,outer);
+            if(SUCCEEDED(h)){
+                if(directfx::install(*out,directfx::waterOnlyBase+physical,fmt->nSamplesPerSec)){
+                    directfx::waterAttached[physical]=true;return h;
+                }
+                (*out)->Release();*out=nullptr;
+            }
+        }
         return ds->CreateSoundBuffer(original,out,outer);
+    }
     DSBUFFERDESC desc=*original;
     desc.dwFlags=(desc.dwFlags&~DSBCAPS_LOCHARDWARE)|DSBCAPS_LOCSOFTWARE;
     if(headphones)desc.guid3DAlgorithm=DS3DALG_HRTF_FULL;
@@ -582,7 +546,7 @@ HRESULT createNativeBuffer(IDirectSound* ds,const DSBUFFERDESC* original,IDirect
         if(SUCCEEDED(hr)){
             bool sdk=directfx::install(*out,slot,fmt->nSamplesPerSec);
             if(sdk || addAirEq(*out)){
-                directfx::attached[slot]=sdk;
+                directfx::attached[slot]=sdk;directfx::waterAttached[slot]=sdk;
                 return hr;
             }
             (*out)->Release();*out=nullptr;
@@ -1158,64 +1122,19 @@ void updateSources(DWORD now) {
     }
 }
 
-// Legacy and short buffers cannot always host DirectSound FX. Keep an original
-// copy only while filtered, and restore it when surfacing. Only touch the
-// game's static mono buffers, never its shared sound banks.
-struct WaterCopy {
-    IDirectSoundBuffer* buffer{};
-    std::vector<short> dry;
-    int strength=-1,hz{},db{},mod{},sharedStep{};
-    ~WaterCopy(){clear();}
-    void clear(){if(buffer)buffer->Release();buffer=nullptr;dry.clear();strength=-1;}
-    void update(IDirectSoundBuffer* b,float wet,float shared){
-        if(buffer!=b)clear();
-        int level=int(std::clamp(wet,0.f,1.f)*8+.5f);
-        int common=int(shared*8+.5f);
-        if(!b || (!level && !buffer) || (level==strength && common==sharedStep && hz==immersion::cutoff && db==immersion::loss && mod==immersion::modulation))return;
-        DSBCAPS caps{};caps.dwSize=sizeof caps;WAVEFORMATEX fmt{};
-        if(FAILED(b->GetCaps(&caps)) || caps.dwBufferBytes<2 || caps.dwBufferBytes>8u*1024*1024 ||
-           FAILED(b->GetFormat(&fmt,sizeof fmt,nullptr)) || fmt.nChannels!=1 || fmt.wFormatTag!=WAVE_FORMAT_PCM || fmt.wBitsPerSample!=16 || !fmt.nSamplesPerSec)return;
-        if(!buffer)dry.resize(caps.dwBufferBytes/2);
-        void *first{},*second{};DWORD n{},m{};
-        if(FAILED(b->Lock(0,0,&first,&n,&second,&m,DSBLOCK_ENTIREBUFFER)))return;
-        if(dry.size()*2==n+m && !(n%2 || m%2)){
-            if(!buffer){
-                memcpy(dry.data(),first,n);if(m)memcpy(dry.data()+n/2,second,m);
-                buffer=b;b->AddRef();
-            }
-            immersion::Filter f;f.prepare(level/8.f,float(fmt.nSamplesPerSec),common/8.f);f.mix=f.target;
-            for(unsigned j=0;j<dry.size();j++){
-                auto dest=j<n/2?static_cast<short*>(first)+j:static_cast<short*>(second)+(j-n/2);
-                *dest=level?short(std::clamp(f.sample(dry[j]),-32768.f,32767.f)):dry[j];
-            }
-            strength=level;sharedStep=common;hz=immersion::cutoff;db=immersion::loss;mod=immersion::modulation;
-        }
-        b->Unlock(first,n,second,m);if(!level)clear();
-    }
-};
-WaterCopy waterCopies[64];
-void updateStaticWater(uintptr_t channel,IDirectSoundBuffer* b,bool starting){
-    int count=std::min(64,int(read<unsigned short>(hardware+0x8e)));
-    for(int slot=0;slot<count;slot++)if(read<uintptr_t>(hardware+0xe64+4*slot)==channel){
-        if(starting && waterCopies[slot].buffer!=b)waterCopies[slot].clear();
-        if(!directfx::attached[slot])waterCopies[slot].update(b,immersion::amount(slot),immersion::sharedWater(slot));
-        return;
-    }
-}
+StaticWater waterCopies[64];
 void refreshStaticWater(){
     int count=std::min(64,int(read<unsigned short>(hardware+0x8e)));
     auto stream=read<uintptr_t>(hardware+0xe10);
     for(int slot=0;slot<count;slot++){
         auto channel=read<uintptr_t>(hardware+0xe64+4*slot);
-        if(!channel || channel==stream || directfx::attached[slot]){waterCopies[slot].clear();continue;}
-        auto b=read<IDirectSoundBuffer*>(channel+8);
-        waterCopies[slot].update(b,immersion::amount(slot),immersion::sharedWater(slot));
+        if(!channel || channel==stream || directfx::waterAttached[slot]){waterCopies[slot].forget();continue;}
+        waterCopies[slot].update(read<IDirectSoundBuffer*>(channel+8),read<uintptr_t>(channel+0x84),immersion::channel(slot));
     }
 }
 // Copy the static sound bank sample while the game owns the channel.
 // The mixer queries playback state but never locks the game's playback buffer.
 HRESULT WINAPI play(IDirectSoundBuffer* b,uintptr_t channel,DWORD flags) {
-    if(GetCurrentThreadId()==gameThread)updateStaticWater(channel,b,true);
     auto nativePlay=[&](){return b->Play(0,0,flags);};
     if(!ready.load())return nativePlay();
     WAVEFORMATEX fmt{}; DSBCAPS caps{}; caps.dwSize=sizeof(caps);
@@ -1227,6 +1146,8 @@ HRESULT WINAPI play(IDirectSoundBuffer* b,uintptr_t channel,DWORD flags) {
         if (read<uintptr_t>(hardware+0xE64+4*i)==channel) {physical=i;break;}
     }
     if (physical<0) return nativePlay();
+    if(GetCurrentThreadId()==gameThread && !directfx::waterAttached[physical])
+        waterCopies[physical].update(b,read<uintptr_t>(channel+0x84),immersion::channel(physical));
     Voice fresh{};
     if(!directfx::attached[physical] && (caps.dwFlags&DSBCAPS_CTRLFX))fresh.airEq=getAirEq(b);
     fresh.looping=(flags&DSBPLAY_LOOPING)!=0;
@@ -1302,6 +1223,8 @@ struct MixBuses {
         last={};
     }
 };
+
+immersion::Transmission emitterWater[64],listenerWater[2];
 
 bool mixVoice(Voice& v,MixBuses buses,bool active,unsigned queuedFrames,EarlyPaths paths,ArrivalQueue& queue) {
     auto fadeVoice=[&](){
@@ -1418,16 +1341,28 @@ bool mixVoice(Voice& v,MixBuses buses,bool active,unsigned queuedFrames,EarlyPat
         v.nearWall[side].update(path,v.looping,resync || stretch!=v.wallStretch,stretch);
     }
     v.wallStretch=stretch;
-    v.submergedSource.prepare(immersion::source[v.channel].load()*(1.f-immersion::listener.load()),Room::rate);
+    // Per-channel state belongs to the worker. A new sound starts with clean history.
+    auto& sub=emitterWater[v.channel];
+    const auto medium=immersion::settings(immersion::source[v.channel].load()*(1.f-immersion::listener.load()));
+    if(resync)sub.clear();
+    auto resample=[&](int i){
+        const double p=frac+i*step;
+        const DWORD j=DWORD(p);
+        const float x=sample(j);
+        return x+float(p-j)*(sample(j+1)-x);
+    };
+    float sourcePCM[frames];
+    const bool throughWater=sub.needsAudio(medium.wet);
+    if(throughWater){
+        for(int i=0;i<frames;i++)sourcePCM[i]=resample(i)/32768.f;
+        for(unsigned i=0;i<frames;i+=immersion::block)sub.process(sourcePCM+i,medium);
+    }else sub.noteDry();
     auto before=v.lastBus;
     float panTarget=pans[v.channel].load()*.001f;
     const float wallOffset=wallPanOffset[v.channel].load();
     float edgeFilter=.87f-.66f*shadows[v.channel].load()*.001f;
     for (int i=0;i<frames;i++) {
-        double p=frac+i*step;DWORD j=DWORD(p);
-        float first=sample(j);
-        float raw=first+float(p-j)*(sample(j+1)-first);
-        raw=v.submergedSource.sample(raw);
+        float raw=throughWater?32768.f*sourcePCM[i]:resample(i);
         v.airLow+=.48f*(raw-v.airLow);
         raw=v.airLow+highBand*(raw-v.airLow);
         float intensity=std::abs(raw)*emitted/32768.f;
@@ -1559,6 +1494,7 @@ void render(short* out,SteamReturn& steam,SteamReturn (&emit)[2], SoundField& fi
     }
     static float decayEnvelope=450.f, bassReturn[2]{};
     static bool silent=false;
+    static float low[2][2]{},hallBass[2]{};
     static float lateLow[2]{};
     static Room emitterFallback[2];
     static int lastStretch=100,lastEchoDelay=0,lastPreDelay=0;
@@ -1566,10 +1502,26 @@ void render(short* out,SteamReturn& steam,SteamReturn (&emit)[2], SoundField& fi
     static unsigned delayHead=0;
     static float taps[2][8192]{};static unsigned tapHead=0;
     if (state<0) {
-        blend=0;lateLow[0]=lateLow[1]=0;
-        if(!silent){std::memset(delayed,0,sizeof delayed);for(auto& e:emit) if(e.effect)e.reset(e.effect);for(auto& r:emitterFallback)r.clear();std::memset(taps,0,sizeof taps);}
-        if (!silent) { std::memset(queue.stereo,0,sizeof(queue.stereo)); if (steam.effect) steam.reset(steam.effect); limiter={}; for(auto& ch:early) std::fill_n(ch,16384,0.f); for(auto& bus:tone)for(auto& f:bus)f={}; for(auto& bus:equalizer)for(auto& f:bus)f.clear();covered=0;diffuse=0; room.clear(); longRoom.clear(); }
-        silent=true;level=0;decayEnvelope=450.f;bassReturn[0]=bassReturn[1]=0;std::fill_n(out,frames*2,0);return;
+        if(!silent){
+            listenerWater[Player].clear();
+            std::memset(low,0,sizeof low);
+            std::fill_n(hallBass,2,0.f);
+            std::memset(delayed,0,sizeof delayed);
+            std::memset(taps,0,sizeof taps);
+            std::memset(queue.stereo,0,sizeof queue.stereo);
+            if(steam.effect)steam.reset(steam.effect);
+            for(auto& e:emit)if(e.effect)e.reset(e.effect);
+            for(auto& r:emitterFallback)r.clear();
+            for(auto& ch:early)std::fill_n(ch,16384,0.f);
+            for(auto& bus:tone)for(auto& f:bus)f={};
+            for(auto& bus:equalizer)for(auto& f:bus)f.clear();
+            room.clear();longRoom.clear();limiter={};
+            covered=diffuse=blend=level=0;
+            std::fill_n(lateLow,2,0.f);
+            std::fill_n(bassReturn,2,0.f);
+            decayEnvelope=450.f;silent=true;
+        }
+        std::fill_n(out,frames*2,0);return;
     }
     silent=false;
     float diffuseTarget=diffusionPercent.load()*.01f;
@@ -1578,7 +1530,6 @@ void render(short* out,SteamReturn& steam,SteamReturn (&emit)[2], SoundField& fi
     static float soft=0;
     soft+=.04f*(materialPercent.load()*.01f-soft);
     float high=reflectedHigh.load()*(1.f-.58f*soft);
-    static float low[2][2]{};
     // One update per 8 ms block. Let energy stored under the roof ring out at the exit.
     float wantedDecay=float(decayMs.load());
     decayEnvelope+=(wantedDecay-decayEnvelope)*(wantedDecay>decayEnvelope?.035f:(wantedDecay<800.f && enclosedAmount.load()>.75f?.035f:.005f));
@@ -1587,7 +1538,7 @@ void render(short* out,SteamReturn& steam,SteamReturn (&emit)[2], SoundField& fi
     const int echoOffset=32*echoDelayMs.load(),lateOffset=32*preDelayMs.load();
     int decay=int(decayEnvelope);
     room.setDecay(int(duration*std::min(decay,1050)));
-    longRoom.setDecay(int(duration*decay));
+    if(!steam.effect)longRoom.setDecay(int(duration*decay));
     static float enclosedMix=0,corridorMix=0;
     enclosedMix+=.045f*(enclosedAmount.load()-enclosedMix);
     corridorMix+=.045f*(corridorAmount.load()-corridorMix);
@@ -1656,7 +1607,6 @@ void render(short* out,SteamReturn& steam,SteamReturn (&emit)[2], SoundField& fi
         for (int ch=0;ch<2;ch++) {
             auto& sample=wetBlock[2*i+ch];
             sample+=lateOutput[i];
-            static float hallBass[2]{};
             hallBass[ch]+=.032f*(sample-hallBass[ch]);
             sample+=(hall*.80f+.60f*city)*hallBass[ch];
             for(int b=0;b<2;b++){
@@ -1711,31 +1661,27 @@ void render(short* out,SteamReturn& steam,SteamReturn (&emit)[2], SoundField& fi
     lastStretch=stretch;lastEchoDelay=echoOffset;lastPreDelay=lateOffset;
     delayHead=(delayHead+frames)&8191;
     tapHead=(tapHead+frames)&8191;
-    static immersion::Filter waterReturn[2];
-    for(auto& f:waterReturn)f.prepare(immersion::listener.load(),Room::rate);
-    for(int i=0;i<frames;i++){
-        for(int ch=0;ch<2;ch++){
-            int at=i*2+ch;
-            wetBlock[at]=waterReturn[ch].sample(wetBlock[at]);
-        }
-    }
+    const auto medium=immersion::settings(immersion::listener.load());
+    for(unsigned i=0;i<frames;i+=immersion::block)
+        listenerWater[Player].process(wetBlock.data()+2*i,medium);
     if(limiter.process(wetBlock,out) && logging.load())++limitedBlocks;
 }
 
-HMODULE pluginModule{};
 DWORD WINAPI worker(void*) {
     SteamReturn steam[2],emit[2][2];
     SoundField field[2];
-    wchar_t location[32768]{};
-    DWORD length=GetModuleFileNameW(pluginModule,location,32768);
-    if(length && length<32768){
-        std::wstring directory(location,length);
-        directory.resize(directory.find_last_of(L"/\\")+1);
-        for(int g=0;g<2;g++)if(steam[g].start((directory+L"phonon.dll").c_str(),Room::rate,frames)){
-            field[g].start(steam[g]);
-            for(auto& e:emit[g])e.start((directory+L"phonon.dll").c_str(),Room::rate,frames);
+    if(steam[0].start((pluginDirectory()+L"phonon.dll").c_str(),Room::rate,frames)){
+        steam[1].startSibling(steam[0],Room::rate,frames);
+        for(int group=0;group<2;group++)if(steam[group].effect){
+            field[group].start(steam[group]);
+            for(auto& emitter:emit[group])emitter.startSibling(steam[0],Room::rate,frames);
         }
-        sdkReverbReady=steam[0].effect!=nullptr;fieldReady=field[0].available;hrtfReady=field[0].hrtf!=nullptr;
+    }
+    sdkReverbReady=steam[0].effect!=nullptr;
+    fieldReady=field[0].available;hrtfReady=field[0].hrtf!=nullptr;
+    if(directfx::ready){
+        for(auto& water:emitterWater)water.open(directfx::api,Room::rate,1);
+        for(auto& water:listenerWater)water.open(directfx::api,Room::rate,2);
     }
     constexpr int blocks=8;
     WAVEFORMATEX format{WAVE_FORMAT_PCM,2,Room::rate,Room::rate*4,4,16,0};
@@ -1858,15 +1804,15 @@ void writeStatus(bool force=false){
     std::fprintf(file,"t=%lu area=%d stadium=%d stadiumModel=%d acousticsActive=%d outputReady=%d outputError=%u\n",
         now,currentArea,int(stadiumActive),stadiumModel,int(enclosure.load()>=0),int(ready.load()),outputError.load());
     std::fprintf(file,"  SDK directSimulation=%d directFactory=%d reverb=%d ambisonicsDecoder=%d HRTF=%d DopplerHook=%d radioHook=%d\n",
-        int(live::started),int(directfx::activation!=INVALID_HANDLE_VALUE),int(sdkReverbReady.load()),
+        int(live::started),int(directfx::ready.load() && directfx::activation!=INVALID_HANDLE_VALUE),int(sdkReverbReady.load()),
         int(fieldReady.load()),int(hrtfReady.load()),int(alternativePitch),int(radioHook));
     std::fprintf(file,"  voices active=%u SteamDirect=%u compatibility=%u speech=%u blocked=%u detours=%u wallReturns=%u entranceReturns=%u\n",
         active,attached,active-attached,speechCount,blocked,routes,echoes,entries);
     std::fprintf(file,"  effects echo=%d reverb=%d wet=%.2f decayMs=%d street=%.3f enclosure=%.3f corridor=%.3f ambisonics=%d headphones=%d\n",
         int(wallEcho.load()),int(lateReverb.load()),wet.load(),decayMs.load(),cityReturn.load(),
         enclosedAmount.load(),corridorAmount.load(),int(useField.load()),int(headphones.load()));
-    std::fprintf(file,"  water enabled=%d listener=%.3f sources=%u radioFiltered=%d cutoffHz=%d lossDb=%d modulation=%d\n",
-        int(waterEnabled),immersion::listener.load(),submerged,int(radioFiltered.load()),
+    std::fprintf(file,"  water enabled=%d listener=%.3f sources=%u radioFiltered=%d steamWater=%d radioChain=%d cutoffHz=%d lossDb=%d modulation=%d\n",
+        int(waterEnabled),immersion::listener.load(),submerged,int(directfx::streamWet.load()),int(directfx::ready.load()),int(directfx::streamActive.load()),
         immersion::cutoff.load(),immersion::loss.load(),immersion::modulation.load());
     auto injury=healthAudio::snapshot();
     std::fprintf(file,"  lowHealth enabled=%d threshold=%d strength=%d amount=%.3f deathGain=%.3f bypass=%d outputMix=%d\n",
@@ -1885,7 +1831,7 @@ void loadSettings(){
     if(logging && !wasLogging){
         logPath=iniPath.substr(0,iniPath.size()-4)+L".log";
         if(FILE* file=_wfopen(logPath.c_str(),L"w")){
-            std::fputs("Rebound.SA 0.61\nStatus every 5 seconds. Counters are cumulative for this game session.\n",file);
+            std::fputs("Rebound.SA 0.62\nStatus every 5 seconds. Counters are cumulative for this game session.\n",file);
             std::fclose(file);
         }
     }
@@ -1945,9 +1891,9 @@ void frame() {
     static bool triedDirect=false;
     if(!triedDirect){
         triedDirect=true;
-        live::started=live::start(iniPath.substr(0,iniPath.find_last_of(L"/\\")+1)+L"phonon.dll");
-        if(live::started)
-            directfx::start(iniPath.substr(0,iniPath.find_last_of(L"/\\")+1),live::context);
+        const auto directory=pluginDirectory();
+        directfx::start(directory);
+        live::started=live::start(directory+L"phonon.dll");
     }
     if (!started) {
         HANDLE h=CreateThread(nullptr,0,worker,nullptr,0,nullptr);
@@ -1960,7 +1906,7 @@ void frame() {
     unsigned playerIndex=read<BYTE>(0xB7CD74);
     bool wasted=playerIndex<2 && read<BYTE>(0xB7CD98+0x190*playerIndex+0xdc)==1;
     float screenAlpha=read<float>(0xB6F028+0xbfc);
-    float sfx=read<float>(audioHw+0x414)*read<float>(audioHw+0x41c);
+    float sfx=read<float>(hardware+0x414)*read<float>(hardware+0x41c);
     healthAudio::master=std::isfinite(sfx)?std::clamp(sfx,0.f,1.f):0.f;
     healthAudio::publish(life.update(ped!=0,ped?read<float>(ped+0x540):0.f,ped?read<float>(ped+0x544):0.f,
         wasted,screenAlpha,healthAudio::threshold,healthAudio::strength,healthAudio::enabled,paused || healthAudio::excluded()));
@@ -1975,7 +1921,6 @@ void frame() {
     }
     playerPed=ped;
     immersion::listener=targetWater;
-    updateRadio(targetWater);
     refreshStaticWater();
     currentArea=read<int>(0xB72914);
     stadiumActive=ped && inStadium(currentArea,now);
@@ -2006,7 +1951,7 @@ bool matches(uintptr_t addr,const char* sig,size_t size) {
 }
 using GameDeviceCreate=HRESULT(WINAPI*)(LPCGUID,IDirectSound**,IUnknown*);
 HRESULT WINAPI createGameDevice(LPCGUID device,IDirectSound** out,IUnknown* outer){
-    gameOutput::arm(iniPath.substr(0,iniPath.find_last_of(L"/\\")+1)+L"phonon.dll");
+    gameOutput::arm(pluginDirectory()+L"phonon.dll");
     gameOutput::opening=true;
     auto original=read<GameDeviceCreate>(0x85801c);
     HRESULT h=original(device,out,outer);
@@ -2014,7 +1959,6 @@ HRESULT WINAPI createGameDevice(LPCGUID device,IDirectSound** out,IUnknown* oute
     return h;
 }
 void install(HMODULE mod) {
-    pluginModule=mod;
     constexpr uintptr_t audio=0x4f10af, tick=0x53e981;
     if (uintptr_t(GetModuleHandleW(nullptr))!=0x400000 ||
         !matches(audio,"\x6a\x00\x6a\x00\x50\xff\x51\x30",8) || !matches(tick,"\xe8",1) ||
@@ -2066,23 +2010,15 @@ void install(HMODULE mod) {
                 }
             }
             waterGeometry=matches(0x6eb690,"\x8b\x54\x24\x0c",4);
-            constexpr uintptr_t mix=0x4d8d60;
-            if(matches(mix,"\xe8\xfb\xee\xff\xff",5) &&
-               matches(0x4f1ae0,"\x83\xec\x50\x53",4) && matches(0x4f1f30,"\x83\xec\x0c\x53",4)){
-                DWORD old;auto operand=reinterpret_cast<void*>(mix+1);
-                if(VirtualProtect(operand,4,PAGE_EXECUTE_READWRITE,&old)){
-                    uint32_t offset=uintptr_t(radioVolume)-mix-5;
-                    memcpy(operand,&offset,4);FlushInstructionCache(GetCurrentProcess(),operand,4);
-                    VirtualProtect(operand,4,old,&tmp);radioHook=true;
-                }
-            }
-            constexpr uintptr_t startVolume=0x4f1dbf;
-            if(radioHook && matches(startVolume,"\x50\x57\xff\x53\x3c",5)){
-                auto code=reinterpret_cast<BYTE*>(startVolume); DWORD old;
-                if(VirtualProtect(code,5,PAGE_EXECUTE_READWRITE,&old)){
-                    uint32_t rel=uintptr_t(startStreamThunk)-startVolume-5;
-                    code[0]=0xe8;memcpy(code+1,&rel,4);
-                    FlushInstructionCache(GetCurrentProcess(),code,5);VirtualProtect(code,5,old,&tmp);
+            constexpr uintptr_t streamCreate=0x4f238f;
+            if(matches(streamCreate,"\x8b\x08\x50\xff\x51\x0c\x85\xc0",8)){
+                DWORD protection;
+                auto site=reinterpret_cast<BYTE*>(streamCreate);
+                if(VirtualProtect(site,6,PAGE_EXECUTE_READWRITE,&protection)){
+                    uint32_t rel=uintptr_t(createStreamBuffer)-(streamCreate+6);
+                    site[0]=0x50;site[1]=0xe8;std::memcpy(site+2,&rel,4);
+                    FlushInstructionCache(GetCurrentProcess(),site,6);
+                    VirtualProtect(site,6,protection,&protection);radioHook=true;
                 }
             }
             bool compatible=true;

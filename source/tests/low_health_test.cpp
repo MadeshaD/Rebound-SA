@@ -1,5 +1,6 @@
 #include "../injury_mix.h"
 #include "../stem_queue.h"
+#include "../limiter.h"
 #include "../mix_pcm.h"
 #include <cassert>
 #include <cstdio>
@@ -47,15 +48,18 @@ struct TestTail {
 static void routing(){
     injury::Program a,b;a.configure(rate);b.configure(rate);
     TestTail ta,tb;
-    for(unsigned i=0;i<rate/2;i++){
-        State state{.9f,1.f,false};
+    // Put a different tone on each stem, then measure the voice with and
+    // without the simultaneous world signal. The ringing oscillator is muted.
+    double voiceEnergy=0,normalEnergy=0;
+    for(unsigned i=0;i<rate;i++){
+        State state{1.f,1.f,false};
         if(i%143==0){a.prepare(state,2,ta);b.prepare(state,2,tb);}
-        float native=float(.05*std::sin(tau*180*i/rate)),world=float(.12*std::sin(tau*1800*i/rate));
-        float sound[]={native+world,native-world},other[]={sound[0],sound[1]};
-        float cj[]={float(.14*std::cos(tau*6000*i/rate)),float(.16*std::sin(tau*2000*i/rate))},none[2]{};
+        float world=float(.075*std::sin(tau*180*i/rate)),voice=float(.16*std::sin(tau*8000*i/rate));
+        float sound[]={world,world},other[]={world,world},cj[]={voice,voice},none[2]{};
         a.sample(sound,cj,2,-1,state,0,ta);b.sample(other,none,2,-1,state,0,tb);
-        for(int c=0;c<2;c++)assert(std::abs((sound[c]-other[c])-cj[c])<1.e-6f);
+        if(i>rate/2){float d=sound[0]-other[0];voiceEnergy+=d*d;normalEnergy+=voice*voice;}
     }
+    assert(voiceEnergy>normalEnergy*.001 && voiceEnergy<normalEnergy*.5);
     for(auto s:{State{},State{1,0,false},State{0,.45f,false},State{0,1,false}}){
         a.prepare(s,2,ta);
         float x[]={.1f,-.25f},cj[]={.5f,.25f};
@@ -65,13 +69,21 @@ static void routing(){
         if(s.fade>0 && s.fade<1)assert(x[0]<=.6f*s.fade+.001f);
         a.reset(ta);
     }
-    injury::State critical{1,1,false};
-    a.prepare(critical,2,ta);
-    for(unsigned i=0;i<rate/4;i++){
-        float x[2]{},cj[]={i==0?.75f:0.f,-.13f};
-        a.sample(x,cj,2,-1,critical,0,ta);
-        assert(x[0]==cj[0] && x[1]==cj[1]);
-    }
+    auto gain8k=[](bool player,float depth){
+        injury::Program p;p.configure(rate);TestTail tail;State state{depth,1,false};
+        double power=0;
+        for(unsigned i=0;i<rate;i++){
+            if(i%256==0)p.prepare(state,2,tail);
+            float tone=float(.1*std::sin(tau*8000*i/rate));
+            float mix[]={player?0.f:tone,player?0.f:tone},voice[]={player?tone:0.f,player?tone:0.f};
+            p.sample(mix,voice,2,-1,state,0,tail);
+            if(i>=rate/2)power+=mix[0]*mix[0];
+        }
+        return 10*std::log10(power/(rate*.0025));
+    };
+    const double ordinary=gain8k(false,.9375f),player=gain8k(true,.9375f),healthy=gain8k(true,0);
+    assert(player>ordinary+6 && player<healthy-3 && std::abs(healthy)<.01);
+    std::printf("8 kHz at 1 HP: world %.1f dB, CJ %.1f dB, healthy %.1f dB\n",ordinary,player,healthy);
     injury::Tone clean,half,deep;
     clean.prepare(0,rate,true);half.prepare(.5f,rate,true);deep.prepare(1,rate,true);
     double normal=0,middle=0,low=0;
@@ -130,4 +142,11 @@ static void sampleFormats(){
     unsigned char p[4]{};mixpcm::write(p,padded,.12345678f);
     assert(!p[0] && std::abs(mixpcm::read(p,padded)-.12345678f)<2.e-7f);
 }
-int main(){healthTransitions();routing();stemClock();sampleFormats();std::puts("Health, routing, format and stem clock checks passed.");}
+static void limiterSanity(){
+    WetLimiter<8> limiter;
+    WetLimiter<8>::Block samples{};short out[16]{};
+    samples[0]=NAN;samples[1]=INFINITY;samples[2]=-.7f;samples[3]=.7f;
+    limiter.process(samples,out);samples.fill(0);limiter.process(samples,out);
+    assert(out[0]==0 && out[1]==0 && out[2]<0 && out[3]>0);
+}
+int main(){healthTransitions();routing();stemClock();sampleFormats();limiterSanity();std::puts("Health, routing, format and stem clock checks passed.");}

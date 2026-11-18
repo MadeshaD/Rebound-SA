@@ -1,6 +1,6 @@
 #pragma once
 
-// Keep DirectSound as the sole renderer of each direct voice.
+// DirectSound voice controls and the fallback EQ for spatial buffers that reject the SDK insert.
 std::atomic<bool> headphones{true};
 std::atomic<int> airDistance[64]{},emissionDb[64]{},spatialVoice[64]{};
 

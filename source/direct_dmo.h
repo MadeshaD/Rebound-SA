@@ -7,13 +7,15 @@ constexpr GUID controlId={0xb4e10697,0xa0df,0x48e6,{0xb7,0x43,0x20,0xa9,0x88,0x9
 constexpr int block=64;
 struct Controls {std::atomic<float> metres{};std::atomic<float> visibility{1.f};std::atomic<float> transmission[3]{{1.f},{1.f},{1.f}},air[3]{{1.f},{1.f},{1.f}};};
 Controls controls[64];
-std::atomic<bool> attached[64]{};
+std::atomic<bool> attached[64]{},waterAttached[64]{};
 HANDLE activation=INVALID_HANDLE_VALUE;
-IPLContext context{};
-decltype(&iplDirectEffectCreate) create{};
-decltype(&iplDirectEffectApply) apply{};
-decltype(&iplDirectEffectRelease) release{};
-decltype(&iplDirectEffectReset) reset{};
+immersion::DirectApi api;
+std::atomic<bool> ready{},streamActive{},streamWet{};
+constexpr int streamSlot=64,waterOnlyBase=65;
+bool isAmbientStream(){
+    // CAEAudioHardware's active streaming track ID in the validated 1.0 US layout.
+    return *reinterpret_cast<volatile const LONG*>(0xB5F8B8+0xe14+0x34)==174;
+}
 struct Control: IUnknown {virtual HRESULT STDMETHODCALLTYPE Attach(int slot,DWORD rate)=0;};
 
 class Effect final: public IMediaObject, public IMediaObjectInPlace, public Control {
@@ -23,9 +25,11 @@ class Effect final: public IMediaObject, public IMediaObjectInPlace, public Cont
     DWORD rate=0;
     WAVEFORMATEX input{},output{};
     float samples[block]{},result[block]{},wall[3]{1,1,1},airGain[3]{1,1,1};
-    float visibility=1.f;immersion::Filter waterFilter;
+    float visibility=1.f;
+    immersion::Transmission water;
+    std::unique_ptr<immersion::Stream> radio;
     AirPath atmosphere;float distance=0;
-    bool counted=false;
+    bool counted=false,waterOnly=false;
     HRESULT set(bool isInput,DWORD i,const DMO_MEDIA_TYPE* type,DWORD flags){
         if(i)return DMO_E_INVALIDSTREAMINDEX;
         auto& fmt=isInput?input:output;
@@ -35,10 +39,10 @@ class Effect final: public IMediaObject, public IMediaObjectInPlace, public Cont
         WAVEFORMATEX f{};memcpy(&f,type->pbFormat,std::min<size_t>(type->cbFormat,sizeof(f)));
         bool pcm=f.wFormatTag==WAVE_FORMAT_PCM && f.wBitsPerSample==16 && type->subtype==MEDIASUBTYPE_PCM;
         bool fp=f.wFormatTag==WAVE_FORMAT_IEEE_FLOAT && f.wBitsPerSample==32 && type->subtype==MEDIASUBTYPE_IEEE_FLOAT;
-        if(!(pcm||fp) || f.nChannels!=1 || f.nBlockAlign!=f.wBitsPerSample/8 ||
-           f.nSamplesPerSec<8000 || f.nSamplesPerSec>192000 || (effect && rate!=f.nSamplesPerSec))return DMO_E_TYPE_NOT_ACCEPTED;
+        if(!(pcm||fp) || (f.nChannels!=1 && f.nChannels!=2) || f.nBlockAlign!=f.nChannels*(f.wBitsPerSample/8) ||
+           f.nSamplesPerSec<8000 || f.nSamplesPerSec>192000 || (slot>=0 && (rate!=f.nSamplesPerSec || f.nChannels!=(slot==streamSlot?2:1))))return DMO_E_TYPE_NOT_ACCEPTED;
         auto& other=isInput?output:input;
-        if(other.nChannels && (other.nSamplesPerSec!=f.nSamplesPerSec || other.wFormatTag!=f.wFormatTag))return DMO_E_TYPE_NOT_ACCEPTED;
+        if(other.nChannels && (other.nSamplesPerSec!=f.nSamplesPerSec || other.wFormatTag!=f.wFormatTag || other.nChannels!=f.nChannels))return DMO_E_TYPE_NOT_ACCEPTED;
         if(!(flags&DMO_SET_TYPEF_TEST_ONLY)){f.cbSize=0;fmt=f;}
         return S_OK;
     }
@@ -52,13 +56,22 @@ class Effect final: public IMediaObject, public IMediaObjectInPlace, public Cont
         t->bFixedSizeSamples=TRUE;t->lSampleSize=fmt.nBlockAlign;return S_OK;
     }
 public:
-    ~Effect(){if(effect)release(&effect);}
+    ~Effect(){if(effect)api.release(&effect);}
     HRESULT STDMETHODCALLTYPE Attach(int channel,DWORD sourceRate) override{
-        if(channel<0||channel>=64||!context)return E_INVALIDARG;
+        if(channel<0 || channel>=waterOnlyBase+64 || !ready.load())return E_INVALIDARG;
+        if(input.nChannels && input.nChannels!=(channel==streamSlot?2:1))return DMO_E_TYPE_NOT_ACCEPTED;
         rate=input.nChannels?input.nSamplesPerSec:sourceRate;
-        IPLAudioSettings settings{int(rate),block};IPLDirectEffectSettings es{1};
-        if(!effect && create(context,&settings,&es,&effect)!=IPL_STATUS_SUCCESS)return E_FAIL;
-        atmosphere.configure(float(rate));slot=channel;return S_OK;
+        if(channel==streamSlot){
+            radio.reset(new(std::nothrow)immersion::Stream);
+            if(!radio || !radio->open(api,rate)){radio.reset();return E_FAIL;}
+        }else{
+            IPLAudioSettings settings{int(rate),block};IPLDirectEffectSettings es{1};
+            waterOnly=channel>=waterOnlyBase;
+            if(!waterOnly && !effect && api.create(api.context,&settings,&es,&effect)!=IPL_STATUS_SUCCESS)return E_FAIL;
+            if(!water.open(api,rate,1))return E_FAIL;
+            atmosphere.configure(float(rate));
+        }
+        slot=waterOnly?channel-waterOnlyBase:channel;return S_OK;
     }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id,void** out) override{
         if(!out)return E_POINTER;
@@ -73,8 +86,18 @@ public:
     ULONG STDMETHODCALLTYPE Release() override{auto n=--refs;if(!n)delete this;return n;}
     HRESULT STDMETHODCALLTYPE Process(ULONG size,BYTE* data,REFERENCE_TIME,DWORD flags) override{
         if(!data)return E_POINTER;
-        if(!effect || !input.nBlockAlign)return S_OK;
-        if(!counted){
+        if(!input.nBlockAlign || (!radio && !effect && !waterOnly))return S_OK;
+        if(radio){
+            const bool ambient=isAmbientStream();
+            const float wet=immersion::listener.load();
+            const unsigned n=size/input.nBlockAlign;
+            if(input.wFormatTag==WAVE_FORMAT_IEEE_FLOAT)
+                radio->process(reinterpret_cast<float*>(data),n,wet,ambient,flags==DMO_INPLACE_ZERO);
+            else radio->process(reinterpret_cast<short*>(data),n,wet,ambient,flags==DMO_INPLACE_ZERO);
+            streamWet=!ambient && wet>.005f;
+            return S_OK;
+        }
+        if(!counted && !waterOnly){
             const auto& control=controls[slot];
             visibility=sdkGain(control.visibility.load());
             for(int k=0;k<3;k++){
@@ -85,16 +108,17 @@ public:
             counted=true;
         }
         bool fp=input.wFormatTag==WAVE_FORMAT_IEEE_FLOAT;
-        waterFilter.prepare(immersion::amount(slot),float(rate),immersion::sharedWater(slot));
+        const auto medium=immersion::channel(slot);
         for(ULONG i=0;i<size/input.nBlockAlign;i++){
-            float original=fp?reinterpret_cast<float*>(data)[i]:reinterpret_cast<short*>(data)[i]/32768.f;
-            samples[pos]=flags==DMO_INPLACE_ZERO?0.f:original;
+            samples[pos]=flags==DMO_INPLACE_ZERO?0.f:
+                (fp?reinterpret_cast<float*>(data)[i]:reinterpret_cast<short*>(data)[i]/32768.f);
             float y=std::isfinite(result[pos])?result[pos]:0.f;
-            y=atmosphere.process(y);
-            y=waterFilter.sample(y);
             if(fp)reinterpret_cast<float*>(data)[i]=y;
             else reinterpret_cast<short*>(data)[i]=short(std::clamp(y*32768.f,-32768.f,32767.f));
             if(++pos!=block)continue;
+            if(waterOnly){
+                std::copy_n(samples,block,result);water.process(result,medium);pos=0;continue;
+            }
             auto follow=[this](float current,float target){
                 target=sdkGain(target);
                 float alpha=std::min(1.f,block/((target<current?.19f:.065f)*rate));
@@ -111,11 +135,14 @@ public:
             auto p=sdkDirectParams(visibility,wall,airGain,rate);
             float* a=samples,*b=result;
             IPLAudioBuffer src{1,block,&a},dst{1,block,&b};
-            apply(effect,&p,&src,&dst);pos=0;
+            api.apply(effect,&p,&src,&dst);
+            for(auto& value:result)value=atmosphere.process(value);
+            water.process(result,medium);
+            pos=0;
         }
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE Flush() override{atmosphere.clear();waterFilter={};pos=0;std::fill_n(result,block,0.f);if(effect)reset(effect);return S_OK;}
+    HRESULT STDMETHODCALLTYPE Flush() override{atmosphere.clear();water.clear();if(radio)radio->clear();pos=0;counted=false;std::fill_n(result,block,0.f);if(effect)api.reset(effect);return S_OK;}
     HRESULT STDMETHODCALLTYPE GetStreamCount(DWORD*a,DWORD*b) override{if(!a||!b)return E_POINTER;*a=*b=1;return S_OK;}
     HRESULT STDMETHODCALLTYPE GetInputStreamInfo(DWORD i,DWORD*f) override{if(i||!f)return E_INVALIDARG;*f=0;return S_OK;}
     HRESULT STDMETHODCALLTYPE GetOutputStreamInfo(DWORD i,DWORD*f) override{if(i||!f)return E_INVALIDARG;*f=0;return S_OK;}
@@ -156,16 +183,11 @@ public:
         HRESULT h=e->QueryInterface(id,p);e->Release();return h;
     }
 };
-bool start(const std::wstring& directory,IPLContext ctx){
-    HMODULE dll=GetModuleHandleW((directory+L"phonon.dll").c_str());
-    if(!dll||!ctx)return false;
-    auto bind=[dll](auto& fn,const char* name){auto p=GetProcAddress(dll,name);memcpy(&fn,&p,sizeof(fn));return p!=nullptr;};
-    if(!bind(create,"_iplDirectEffectCreate@16")||!bind(apply,"_iplDirectEffectApply@16")||
-       !bind(reset,"_iplDirectEffectReset@4")||!bind(release,"_iplDirectEffectRelease@4"))return false;
+bool openFactory(){
     HMODULE module{};
     if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                          reinterpret_cast<LPCWSTR>(&start),&module))return false;
+                          reinterpret_cast<LPCWSTR>(&openFactory),&module))return false;
     wchar_t path[32768]{};
     DWORD length=GetModuleFileNameW(module,path,32768);
     if(!length || length>=32768)return false;
@@ -176,23 +198,53 @@ bool start(const std::wstring& directory,IPLContext ctx){
     a.lpResourceName=MAKEINTRESOURCEW(101);
     a.hModule=module;
     activation=CreateActCtxW(&a);
-    context=ctx;return activation!=INVALID_HANDLE_VALUE;
+    return activation!=INVALID_HANDLE_VALUE;
 }
-bool install(IDirectSoundBuffer* b,int channel,DWORD rate){
-    if(activation==INVALID_HANDLE_VALUE)return false;
+BOOL CALLBACK initializeMedia(PINIT_ONCE,void* argument,void**){
+    // Audio callbacks and cached effects can refer to this context for the
+    // lifetime of the pinned ASI. Initialization is outside the loader lock.
+    auto directory=static_cast<const wchar_t*>(argument);
+    HMODULE dll=LoadLibraryW((std::wstring(directory)+L"phonon.dll").c_str());
+    if(!dll)return FALSE;
+    auto bind=[dll](auto& fn,const char* name){
+        auto p=GetProcAddress(dll,name);std::memcpy(&fn,&p,sizeof(fn));return p!=nullptr;
+    };
+    decltype(&iplContextCreate) newContext{};
+    IPLContextSettings cs{};cs.version=STEAMAUDIO_VERSION;
+    if(!bind(newContext,"_iplContextCreate@8") || !bind(api.create,"_iplDirectEffectCreate@16") ||
+       !bind(api.apply,"_iplDirectEffectApply@16") || !bind(api.reset,"_iplDirectEffectReset@4") ||
+       !bind(api.release,"_iplDirectEffectRelease@4") || newContext(&cs,&api.context)!=IPL_STATUS_SUCCESS){
+        FreeLibrary(dll);return FALSE;
+    }
+    openFactory();ready=true;return TRUE;
+}
+void start(const std::wstring& directory){
+    static INIT_ONCE init=INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&init,initializeMedia,const_cast<wchar_t*>(directory.c_str()),nullptr);
+}
+// Original effects stay in their original order (the game addresses its two
+// radio bass EQs by index). Nothing calls SetFX on an actively playing stream.
+bool appendEffect(IDirectSoundBuffer8* buffer,int channel,DWORD rate,DWORD n,DSEFFECTDESC* native,DWORD* results){
+    if(!ready.load() || activation==INVALID_HANDLE_VALUE || n>8 || (n && !native))return false;
     ULONG_PTR cookie{};
     if(!ActivateActCtx(activation,&cookie))return false;
-    IDirectSoundBuffer8* ext{};Control* ctrl{};bool ok=false;
-    if(SUCCEEDED(b->QueryInterface(IID_IDirectSoundBuffer8,(void**)&ext))){
-        DSEFFECTDESC fx{};fx.dwSize=sizeof(fx);fx.guidDSFXClass=cls;
-        DWORD result{};
-        if(SUCCEEDED(ext->SetFX(1,&fx,&result)) &&
-           SUCCEEDED(ext->GetObjectInPath(cls,0,controlId,(void**)&ctrl))){
-            ok=SUCCEEDED(ctrl->Attach(channel,rate));ctrl->Release();
-        }
-        if(!ok)ext->SetFX(0,nullptr,nullptr);
-        ext->Release();
-    }
-    DeactivateActCtx(0,cookie);return ok;
+    DSEFFECTDESC chain[9]{};
+    DWORD status[9]{};
+    if(n)std::copy_n(native,n,chain);
+    chain[n].dwSize=sizeof(DSEFFECTDESC);chain[n].guidDSFXClass=cls;
+    Control* control{};
+    bool ok=buffer->SetFX(n+1,chain,status)==DS_OK &&
+            SUCCEEDED(buffer->GetObjectInPath(cls,0,controlId,reinterpret_cast<void**>(&control)));
+    if(ok){ok=SUCCEEDED(control->Attach(channel,rate));control->Release();}
+    if(ok && n && results)std::copy_n(status,n,results);
+    DeactivateActCtx(0,cookie);
+    return ok;
+}
+bool install(IDirectSoundBuffer* b,int channel,DWORD rate){
+    IDirectSoundBuffer8* ext{};
+    if(FAILED(b->QueryInterface(IID_IDirectSoundBuffer8,reinterpret_cast<void**>(&ext))))return false;
+    bool ok=appendEffect(ext,channel,rate,0,nullptr,nullptr);
+    if(!ok)ext->SetFX(0,nullptr,nullptr);
+    ext->Release();return ok;
 }
 }

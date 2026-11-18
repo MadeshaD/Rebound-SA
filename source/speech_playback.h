@@ -4,29 +4,36 @@
 struct SpeechPlayback {
     SpeechRoute* route{};
     std::unique_ptr<directfx::Effect> direct;
-    immersion::Filter water;
+    immersion::Transmission water;
     double cursor{};
     float gain{},pan{};
     bool synced{},diverted{},available{true};
     int slot;
-    explicit SpeechPlayback(SpeechRoute* control,int channel,bool nativeDirect):route(control),slot(channel){
-        if(!nativeDirect)return;
+    bool useSpatial,prepared{};
+    SpeechPlayback(SpeechRoute* control,int channel,bool nativeDirect):route(control),slot(channel),useSpatial(nativeDirect){}
+    void prepare(){
+        prepared=true;
+        if(!useSpatial){
+            if(directfx::ready)available=water.open(directfx::api,32000,1);
+            return;
+        }
         direct.reset(new(std::nothrow)directfx::Effect);
         if(!direct){available=false;return;}
         WAVEFORMATEX f{WAVE_FORMAT_IEEE_FLOAT,1,32000,128000,4,32,0};
         DMO_MEDIA_TYPE t{};t.majortype=MEDIATYPE_Audio;t.subtype=MEDIASUBTYPE_IEEE_FLOAT;t.formattype=FORMAT_WaveFormatEx;
         t.cbFormat=sizeof(f);t.pbFormat=reinterpret_cast<BYTE*>(&f);t.bFixedSizeSamples=TRUE;t.lSampleSize=4;
         available=SUCCEEDED(direct->SetInputType(0,&t,0)) && SUCCEEDED(direct->SetOutputType(0,&t,0)) &&
-                  SUCCEEDED(direct->Attach(channel,32000));
+                  SUCCEEDED(direct->Attach(slot,32000));
     }
     ~SpeechPlayback(){if(diverted)route->Divert(FALSE);route->Release();}
     void setRoute(bool requested){
+        if(requested && !prepared)prepare();
         requested&=available;
         if(diverted==requested)return;
         if(SUCCEEDED(route->Divert(requested))){
             diverted=requested;synced=false;gain=0;
             if(direct)direct->Flush();
-            water={};
+            water.clear();
         }
     }
     void mix(IDirectSoundBuffer* buffer,const short* pcm,DWORD count,DWORD prefix,DWORD bufferFrames,
@@ -71,8 +78,8 @@ struct SpeechPlayback {
         }
         if(direct)direct->Process(sizeof(mono),reinterpret_cast<BYTE*>(mono),0,DMO_INPLACE_NORMAL);
         else{
-            water.prepare(immersion::amount(slot),32000,immersion::sharedWater(slot));
-            for(auto& v:mono)v=water.sample(v);
+            const auto medium=immersion::channel(slot);
+            for(unsigned i=0;i<n;i+=immersion::block)water.process(mono+i,medium);
         }
         const float desired=level<=DSBVOLUME_MIN?0.f:std::pow(10.f,level/2000.f);
         for(unsigned i=0;i<n;i++){

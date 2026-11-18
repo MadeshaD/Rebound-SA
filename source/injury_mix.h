@@ -23,10 +23,10 @@ inline float combine(float ordinary,float protectedVoice){
 }
 
 // One instance belongs to the game output. Input already contains all audible
-// spatial effects. Player speech is added at the output, outside the wet send.
+// spatial effects. Player speech has a gentler tone curve and a reduced send to this same tail.
 class Program {
     unsigned rate{},cursor{},tailFrames{};
-    Tone tone[8];
+    Tone tone[8], speechTone[8];
     Ring ring;
     std::array<float,sdkFrames> input{},returned{};
     float depth{},fade=1,follow{},dc{},body{},body2{},tailLow{},tailHigh{},env{},modeX{},modeY{};
@@ -40,22 +40,24 @@ public:
         rotX=damping*std::cos(angle);rotY=damping*std::sin(angle);
         attack=pole(95.f,hz);release=pole(4.f,hz);
     }
+    // A recognized CJ line feeds the same listener reverb at a lower level.
+    static constexpr float speechDepth=.45f,speechSend=.28f;
     bool running()const{return active;}
     template<class Reverb> void reset(Reverb& sdk){
         if(active)sdk.clear();
         active=blockExcited=false;cursor=tailFrames=0;depth=0;fade=1;ring.clear();
         dc=body=body2=tailLow=tailHigh=env=modeX=modeY=0;
-        input.fill(0);returned.fill(0);for(auto& t:tone)t={};
+        input.fill(0);returned.fill(0);for(auto& t:tone)t={};for(auto& t:speechTone)t={};
     }
     template<class Reverb> void prepare(State s,unsigned channels,Reverb& sdk){
         if(s.bypass || s.fade<=0){if(active)reset(sdk);fade=s.fade;return;}
         if(!active && !s.amount && s.fade==1.f)return;
         if(!active){
             fade=s.fade;
-            for(unsigned c=0;c<channels;c++)tone[c].prepare(0,rate,true);
+            for(unsigned c=0;c<channels;c++){tone[c].prepare(0,rate,true);speechTone[c].prepare(0,rate,true);}
         }
         active=true;
-        for(unsigned c=0;c<channels;c++)tone[c].prepare(s.amount,rate);
+        for(unsigned c=0;c<channels;c++){tone[c].prepare(s.amount,rate);speechTone[c].prepare(s.amount*speechDepth,rate);}
         if(!s.amount && s.fade==1 && depth<.0001f && ring.gain<.000001f)reset(sdk);
     }
     template<class Reverb> void sample(float* game,const float* speech,unsigned channels,int lfe,
@@ -70,7 +72,8 @@ public:
         float mid=0,sum=0,peak=0;
         for(unsigned c=0;c<channels;c++){
             float weight=int(c)==lfe?.22f:(c==0?1.f:c==1?.82f:.65f);
-            mid+=weight*game[c];sum+=weight;peak=std::max(peak,std::abs(game[c]));
+            float send=game[c]+speechSend*speech[c];
+            mid+=weight*send;sum+=weight;peak=std::max(peak,std::abs(send));
         }
         mid/=sum;
         dc+=hp*(mid-dc);body+=lp*(mid-dc-body);body2+=lp*(body-body2);
@@ -104,7 +107,8 @@ public:
             float dry=tone[c].sample(game[c]);
             float extra=int(c)==lfe?.7f*rumble:(c<2?rumble+ears:.54f*rumble);
             const float scene=dry*(1.f-.14f*depth)+extra;
-            game[c]=fade*(depth>.001f?combine(scene,speech[c]):scene+speech[c]);
+            const float voice=speechTone[c].sample(speech[c]);
+            game[c]=fade*(depth>.001f?combine(scene,voice):scene+voice);
         }
     }
 };

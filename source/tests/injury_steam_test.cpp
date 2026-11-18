@@ -52,10 +52,9 @@ Result probe(unsigned rate,float amount,bool checkSpeech=false){
         float mix[2]={x,x},cj[2]{};
         if(checkSpeech){cj[0]=cj[1]=x;mix[0]=mix[1]=0;}
         program.sample(mix,cj,2,-1,state,0,sdk);
-        if(checkSpeech)assert(mix[0]==x && mix[1]==x);
         if(i>=end)output[i-end]=mix[0];
     }
-    return checkSpeech?Result{}:measure(output,rate);
+    return measure(output,rate);
 }
 int main(){
     for(unsigned rate:{32000u,44100u,48000u,96000u}){
@@ -64,6 +63,8 @@ int main(){
         assert(c.earlyDb>a.earlyDb+6 && c.lateDb>b.lateDb && b.lateDb>a.lateDb+3 && c.t40>b.t40 && b.t40>a.t40);
         assert(c.t40>1.5 && c.lateDb>-75);
     }
-    probe(48000,1,true);
+    const auto world=probe(48000,.9375f),cj=probe(48000,.9375f,true);
+    assert(cj.lateDb<world.lateDb-6 && cj.lateDb>world.lateDb-20 && cj.t40>1.8);
+    std::printf("1 HP late tail: ordinary %.2f dBFS, CJ %.2f dBFS\n",world.lateDb,cj.lateDb);
     return 0;
 }

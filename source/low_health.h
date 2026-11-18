@@ -1,7 +1,6 @@
 #pragma once
 #include <algorithm>
 #include <cmath>
-#include <cstdint>
 
 namespace injury {
 struct State {
@@ -42,10 +41,12 @@ struct Life {
 
 inline float pole(float hz,float rate){return -std::expm1(-6.283185307f*hz/rate);}
 struct Tone {
-    float first{},second{},cut{1},mix{},mixGoal{},cutGoal{1},slew{};
+    float first{},second{},cut{1},mix{},mixGoal{},cutGoal{1},slew{},configuredRate{};
     bool initialized{};
     void prepare(float amount,float rate,bool immediate=false){
-        mixGoal=std::clamp(amount,0.f,1.f);
+        const float target=std::clamp(amount,0.f,1.f);
+        if(initialized && !immediate && mixGoal==target && configuredRate==rate)return;
+        configuredRate=rate;mixGoal=target;
         const float hz=std::min(16000.f,.43f*rate)*std::pow(1.f/40.f,mixGoal);
         cutGoal=pole(hz,rate);
         slew=pole(10.f,rate);
