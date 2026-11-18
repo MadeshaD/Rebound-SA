@@ -1,3 +1,6 @@
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -14,6 +17,7 @@
 #include <cstdint>
 #include <cwchar>
 #include <memory>
+#include <iterator>
 #include <vector>
 #include <new>
 #include "room.h"
@@ -29,7 +33,36 @@
 #include "direct_tone.h"
 #include "underwater.h"
 #include "air_path.h"
+#include "low_health.h"
+
+namespace healthAudio {
+std::atomic<bool> enabled{true}, cjVoice[64]{};
+std::atomic<int> threshold{15},strength{100};
+std::atomic<float> master{};
+std::atomic<uint32_t> stateWord{};
+std::atomic<unsigned> stateVersion{};
+std::atomic<DWORD> updated{};
+// These are process-lifetime flags in the supported game. Checking them at
+// the audio boundary also covers menu sounds before the next gameplay tick.
+bool excluded(){
+    auto flag=[](uintptr_t addr){return *reinterpret_cast<volatile const BYTE*>(addr)!=0;};
+    return flag(0xBA67A4) || flag(0xB7CB48) || flag(0xB7CB49) || flag(0xB5F851);
+}
+injury::State snapshot(){
+    const uint32_t word=stateWord.load();
+    if(!word || !enabled.load() || GetTickCount()-updated.load()>1500 || excluded())return {};
+    return {(word&65535)/65535.f,((word>>16)&32767)/32767.f,false};
+}
+void publish(injury::State s){
+    updated=GetTickCount();
+    uint32_t word=s.bypass?0:0x80000000u|(uint32_t(s.fade*32767.f+.5f)<<16)|uint32_t(s.amount*65535.f+.5f);
+    if(bool(stateWord.exchange(word))!=bool(word))++stateVersion;
+}
+}
 #include "direct_dmo.h"
+#include "speech_buffer.h"
+#include "endpoint.h"
+#include "speech_playback.h"
 
 extern "C" __declspec(dllexport) HRESULT WINAPI DllGetClassObject(REFCLSID cls,REFIID id,void** out){
     if(cls!=directfx::cls)return CLASS_E_CLASSNOTAVAILABLE;
@@ -60,7 +93,7 @@ struct Voice {
     NearWallDelay nearWall[2]{};
     int wallStretch{};
     IDirectSoundBuffer* buffer{};
-    DWORD samples{};
+    DWORD samples{},bankRate{};
     AirEq airEq;
     float airLow{},envelope{};
     int lastEq=0;
@@ -76,11 +109,13 @@ struct Voice {
     float bounceCoverage{};
     std::unique_ptr<short[]> pcm;
     DWORD pcmSamples{}, prefix{}, lastPosition{};
+    std::unique_ptr<SpeechPlayback> player;
+    bool isPlayer{};
     bool intro{};
 };
 Voice voices[64];
-std::array<float,64> retiredField{};
-std::array<float,4> retiredBus{}; // Protected by voiceLock.
+std::array<std::array<float,64>,2> retiredField{};
+std::array<std::array<float,4>,2> retiredBus{}; // Protected by voiceLock.
 SRWLOCK voiceLock=SRWLOCK_INIT;
 std::atomic<int> enclosure{-1};
 std::atomic<bool> ready{false};
@@ -93,8 +128,7 @@ std::wstring iniPath;
 int reloadKey=VK_F8;
 std::atomic<float> reflectedHigh{1.f};
 void (__cdecl *priorFrame)();
-Room room;
-Room longRoom{true};
+
 using Trace=bool (__cdecl*)(const Vec&,const Vec&,Hit&,void*&,
                            bool,bool,bool,bool,bool,bool,bool,bool);
 #include "garage.h"
@@ -511,6 +545,10 @@ int measure() {
 
 constexpr uintptr_t manager=0xB62CB0;
 constexpr uintptr_t hardware=0xB5F8B8;
+bool isPlayerSpeech(uintptr_t sound){
+    return playerPed && (read<uintptr_t>(sound+4)==playerPed+0x294 ||
+        (read<uintptr_t>(sound+8)==playerPed && isPedSpeech(read<short>(sound),read<unsigned>(sound+0xc))));
+}
 int worldChannel(IDirectSoundBuffer** output){
     int base=read<short>(manager+2), count=read<unsigned short>(manager);
     uintptr_t map=read<uintptr_t>(manager+0x87F4);
@@ -524,7 +562,7 @@ int worldChannel(IDirectSoundBuffer** output){
     return -1;
 }
 
-HRESULT WINAPI createSpatial(IDirectSound* ds,const DSBUFFERDESC* original,IDirectSoundBuffer** out,IUnknown* outer){
+HRESULT createNativeBuffer(IDirectSound* ds,const DSBUFFERDESC* original,IDirectSoundBuffer** out,IUnknown* outer){
     int slot=worldChannel(out);
     for(int j=0;j<std::min(64,int(read<unsigned short>(hardware+0x8e)));j++){
         if(read<uintptr_t>(hardware+0xe64+4*j)+8==uintptr_t(out)){
@@ -558,6 +596,22 @@ HRESULT WINAPI createSpatial(IDirectSound* ds,const DSBUFFERDESC* original,IDire
     return ds->CreateSoundBuffer(original,out,outer);
 }
 
+HRESULT WINAPI createSpatial(IDirectSound* ds,const DSBUFFERDESC* desc,IDirectSoundBuffer** out,IUnknown* outer){
+    HRESULT h=createNativeBuffer(ds,desc,out,outer);
+    if(FAILED(h) || !out || !*out || !(desc->dwFlags&DSBCAPS_CTRLVOLUME))return h;
+    int base=read<short>(manager+2),count=read<unsigned short>(manager);
+    auto map=read<uintptr_t>(manager+0x87F4);
+    if(!map || base<0 || count<1 || base+count>64)return h;
+    for(int i=0;i<count;i++){
+        if(read<uintptr_t>(hardware+0xe64+4*(base+i))+8!=uintptr_t(out))continue;
+        int id=read<short>(map+2*i);
+        bool cj=id>=0 && id<300 && isPlayerSpeech(manager+4+0x74*id);
+        healthAudio::cjVoice[base+i]=cj;
+        if(cj)SpeechBuffer::wrap(out);
+        break;
+    }
+    return h;
+}
 // Read the registered emitter's forward vector only for oriented sound events.
 float facingLoss(uintptr_t sound,Vec pos){
     unsigned event=read<unsigned>(sound+0xc);
@@ -659,7 +713,9 @@ void __fastcall sourceVolume(uintptr_t hw,void*,int base,int index,float db,int 
         int id=map ? read<short>(map+2*index) : -1;
         uintptr_t sound=manager+4+0x74*unsigned(std::max(id,0));
         bool personal=false;
-        if(playerPed && id>=0 && id<300 && read<uintptr_t>(sound+4)==playerPed+0x294){
+        const bool cj=id>=0 && id<300 && isPlayerSpeech(sound);
+        healthAudio::cjVoice[physical]=cj;
+        if(cj && read<uintptr_t>(sound+4)==playerPed+0x294){
             short context=read<short>(playerPed+0x294+0xb0);
             personal=context==357 || context==341;
         }
@@ -1160,21 +1216,29 @@ void refreshStaticWater(){
 // The mixer queries playback state but never locks the game's playback buffer.
 HRESULT WINAPI play(IDirectSoundBuffer* b,uintptr_t channel,DWORD flags) {
     if(GetCurrentThreadId()==gameThread)updateStaticWater(channel,b,true);
-    HRESULT hr=b->Play(0,0,flags);
-    if (FAILED(hr) || !ready.load()) return hr;
+    auto nativePlay=[&](){return b->Play(0,0,flags);};
+    if(!ready.load())return nativePlay();
     WAVEFORMATEX fmt{}; DSBCAPS caps{}; caps.dwSize=sizeof(caps);
     if (FAILED(b->GetFormat(&fmt,sizeof(fmt),nullptr)) || fmt.wFormatTag!=WAVE_FORMAT_PCM ||
-        fmt.nChannels!=1 || fmt.wBitsPerSample!=16 || FAILED(b->GetCaps(&caps)) || caps.dwBufferBytes<4) return hr;
+        fmt.nChannels!=1 || fmt.wBitsPerSample!=16 || FAILED(b->GetCaps(&caps)) || caps.dwBufferBytes<4) return nativePlay();
     int physical=-1;
-    const int base=read<short>(manager+2), count=read<unsigned short>(manager);
-    for (int i=std::max(0,base);i<std::min(64,base+count);i++) {
+    const int count=std::min(64,int(read<unsigned short>(hardware+0x8e)));
+    for (int i=0;i<count;i++) {
         if (read<uintptr_t>(hardware+0xE64+4*i)==channel) {physical=i;break;}
     }
-    if (physical<0) return hr;
+    if (physical<0) return nativePlay();
     Voice fresh{};
     if(!directfx::attached[physical] && (caps.dwFlags&DSBCAPS_CTRLFX))fresh.airEq=getAirEq(b);
     fresh.looping=(flags&DSBPLAY_LOOPING)!=0;
     fresh.samples=caps.dwBufferBytes/2;
+    fresh.bankRate=fmt.nSamplesPerSec;
+    fresh.isPlayer=healthAudio::cjVoice[physical].load();
+    const int gameBase=read<short>(manager+2),index=physical-gameBase;
+    const auto gameMap=read<uintptr_t>(manager+0x87f4);
+    if(GetCurrentThreadId()==gameThread && gameMap && gameBase>=0 && index>=0 && index<read<unsigned short>(manager)){
+        int sound=read<short>(gameMap+2*index);
+        fresh.isPlayer=sound>=0 && sound<300 && isPlayerSpeech(manager+4+0x74*sound);
+    }
     DWORD bytes=read<DWORD>(channel+(fresh.looping ? 0x68 : 0x2c));
     DWORD prefix=fresh.looping ? read<DWORD>(channel+0x64) : 0;
     if (bytes>=2 && bytes<=8*1024*1024 && !((bytes|prefix)&1) &&
@@ -1192,12 +1256,30 @@ HRESULT WINAPI play(IDirectSoundBuffer* b,uintptr_t channel,DWORD flags) {
             fresh.intro=prefix && read<BYTE>(channel+0x60) && position>=caps.dwBufferBytes-prefix;
         }
     }
+    if(fresh.isPlayer && fresh.pcm){
+        SpeechRoute* route{};
+        b->QueryInterface(speechRouteId,(void**)&route);
+        if(!route && GetCurrentThreadId()==gameThread && (caps.dwFlags&DSBCAPS_CTRLVOLUME) &&
+           read<IDirectSoundBuffer*>(channel+8)==b){
+            auto** storage=reinterpret_cast<IDirectSoundBuffer**>(channel+8);
+            SpeechBuffer::wrap(storage);
+            b=*storage;b->QueryInterface(speechRouteId,(void**)&route);
+        }
+        if(route){
+            fresh.player.reset(new(std::nothrow)SpeechPlayback(route,physical,directfx::attached[physical]));
+            if(!fresh.player)route->Release();
+            else if(gameOutput::live() && gameOutput::hasSDK && healthAudio::snapshot().amount>0.f)
+                fresh.player->setRoute(true);
+        }
+    }
+    HRESULT hr=nativePlay();
+    if(FAILED(hr))return hr;
     AcquireSRWLockExclusive(&voiceLock);
     // A paused loop can retain its buffer until this physical channel is reused.
     Voice& slot=voices[physical];
     for(auto& v:voices) if(v.buffer && (&v==&slot || v.buffer==b)){
-        retiredField[v.channel]+=v.lastAmbient;
-        for(unsigned k=0;k<v.lastBus.size();++k)retiredBus[k]+=v.lastBus[k];
+        retiredField[v.isPlayer][v.channel]+=v.lastAmbient;
+        for(unsigned k=0;k<v.lastBus.size();++k)retiredBus[v.isPlayer][k]+=v.lastBus[k];
         v.buffer->Release();v={};
     }
     if(fresh.pcm){
@@ -1390,13 +1472,15 @@ bool mixVoice(Voice& v,MixBuses buses,bool active,unsigned queuedFrames,EarlyPat
     return true;
 }
 
-void render(short* out,SteamReturn& steam,SteamReturn (&emit)[2], SoundField& field,unsigned queuedFrames) {
+template<bool Player>
+void render(short* out,SteamReturn& steam,SteamReturn (&emit)[2], SoundField& field,unsigned queuedFrames,float* protectedDry,bool protect,bool retire=false) {
+    static Room room,longRoom{true};
     static WetLimiter<frames> limiter;
     static ArrivalQueue queue;
     WetLimiter<frames>::Block wetBlock{};
     float roomIn[frames*2]{};
     float input[frames]{},stereoSide[frames]{};
-    int state=GetTickCount()-lastFrame.load()>1500 ? -1 : enclosure.load();
+    int state=retire || GetTickCount()-lastFrame.load()>1500 ? -1 : enclosure.load();
     static float early[2][16384]{},wallGain[2]{},farMix[2]{},axialMix=0,covered=0,diffuse=0;
     static ReflectionTone tone[2][2];
     static DirectTone equalizer[2][2];
@@ -1432,11 +1516,16 @@ void render(short* out,SteamReturn& steam,SteamReturn (&emit)[2], SoundField& fi
     const int stretch=echoStretch.load();
     bool mixed[64]{};
     AcquireSRWLockExclusive(&voiceLock);
-    buses.fade(retiredBus);
-    auto outgoing=retiredField;
-    retiredField.fill(0.f);
+    buses.fade(retiredBus[Player]);
+    auto outgoing=retiredField[Player];
+    retiredField[Player].fill(0.f);
     for(auto& v:voices){
-        if(!v.buffer)continue;
+        if(!v.buffer || v.isPlayer!=Player)continue;
+        if constexpr(Player)if(v.player){
+            v.player->setRoute(protect);
+            if(v.player->diverted)v.player->mix(v.buffer,v.pcm.get(),v.pcmSamples,v.prefix,v.samples,
+                v.bankRate,v.looping,v.intro,queuedFrames,pans[v.channel].load()*.001f,protectedDry);
+        }
         int slot=v.channel;
         float* mono=directional[slot];
         if(spatial){std::fill_n(mono,frames,0.f);buses.fieldMono=mono;}
@@ -1635,65 +1724,106 @@ void render(short* out,SteamReturn& steam,SteamReturn (&emit)[2], SoundField& fi
 
 HMODULE pluginModule{};
 DWORD WINAPI worker(void*) {
-    SteamReturn steam,emit[2];
-    SoundField field;
-
-    wchar_t location[32768];
+    SteamReturn steam[2],emit[2][2];
+    SoundField field[2];
+    wchar_t location[32768]{};
     DWORD length=GetModuleFileNameW(pluginModule,location,32768);
-    if (length && length<32768) {
+    if(length && length<32768){
         std::wstring directory(location,length);
         directory.resize(directory.find_last_of(L"/\\")+1);
-
-        bool active=steam.start((directory+L"phonon.dll").c_str(),Room::rate,frames);
-        if(active)field.start(steam);
-        if(active)for(auto& e:emit)e.start((directory+L"phonon.dll").c_str(),Room::rate,frames);
-        sdkReverbReady=active;
-        fieldReady=field.available;
-        hrtfReady=field.hrtf!=nullptr;
-    }
-    WAVEFORMATEX f{WAVE_FORMAT_PCM,2,Room::rate,Room::rate*4,4,16,0};
-    HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
-    if (!event){outputError=GetLastError();return 0;}
-    HWAVEOUT output;
-    MMRESULT result=waveOutOpen(&output,WAVE_MAPPER,&f,reinterpret_cast<DWORD_PTR>(event),0,CALLBACK_EVENT);
-    if (result!=MMSYSERR_NOERROR) {
-        outputError=result;
-        CloseHandle(event);return 0;
+        for(int g=0;g<2;g++)if(steam[g].start((directory+L"phonon.dll").c_str(),Room::rate,frames)){
+            field[g].start(steam[g]);
+            for(auto& e:emit[g])e.start((directory+L"phonon.dll").c_str(),Room::rate,frames);
+        }
+        sdkReverbReady=steam[0].effect!=nullptr;fieldReady=field[0].available;hrtfReady=field[0].hrtf!=nullptr;
     }
     constexpr int blocks=8;
-    SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_ABOVE_NORMAL);
+    WAVEFORMATEX format{WAVE_FORMAT_PCM,2,Room::rate,Room::rate*4,4,16,0};
+    HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+    HWAVEOUT output{};
     WAVEHDR headers[blocks]{};short data[blocks][frames*2]{};
-    int prepared=0;
-    for (;prepared<blocks;prepared++) {
-        auto& h=headers[prepared];
-        h.lpData=reinterpret_cast<char*>(data[prepared]);h.dwBufferLength=sizeof(data[0]);
-        result=waveOutPrepareHeader(output,&h,sizeof(h));
-        if(result!=MMSYSERR_NOERROR){outputError=result;break;}
-    }
-    int index=0;
-    bool submitted=false;
-    if (prepared==blocks) {
-        ready=true;
-        for (;;) {
-            WAVEHDR& h=headers[index];
-            if ((h.dwFlags&WHDR_INQUEUE)!=0) {WaitForSingleObject(event,100);continue;}
-            unsigned queued=0;
-            for(auto& hdr:headers)if(hdr.dwFlags&WHDR_INQUEUE)++queued;
-            if(logging.load() && submitted && queued==0)++queueUnderruns;
-            render(data[index],steam,emit,field,queued*frames);
-            result=waveOutWrite(output,&h,sizeof(h));
-            if(result!=MMSYSERR_NOERROR){outputError=result;break;}
-            submitted=true;
-            index=(index+1)%blocks;
+    int prepared=0,index=0;
+    DWORD lastOpen=GetTickCount()-1000;
+    auto closeFallback=[&](){
+        if(!output)return;
+        waveOutReset(output);
+        for(int i=0;i<prepared;i++)waveOutUnprepareHeader(output,&headers[i],sizeof(WAVEHDR));
+        waveOutClose(output);output=nullptr;prepared=0;index=0;
+    };
+    auto openFallback=[&](){
+        if(!event)return false;
+        auto error=waveOutOpen(&output,WAVE_MAPPER,&format,reinterpret_cast<DWORD_PTR>(event),0,CALLBACK_EVENT);
+        if(error!=MMSYSERR_NOERROR){output=nullptr;outputError=error;return false;}
+        for(;prepared<blocks;prepared++){
+            auto& hdr=headers[prepared];
+            hdr={};hdr.lpData=reinterpret_cast<char*>(data[prepared]);hdr.dwBufferLength=sizeof(data[0]);
+            error=waveOutPrepareHeader(output,&hdr,sizeof(hdr));
+            if(error!=MMSYSERR_NOERROR){outputError=error;closeFallback();return false;}
         }
-        ready=false;
+        return true;
+    };
+    gameOutput::auxiliaryThread=GetCurrentThreadId();
+    SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_ABOVE_NORMAL);
+    ready=true;
+    bool usedFallback=false,speechRendering=false;
+    unsigned tail=0;
+    for(;;){
+        bool shared=gameOutput::live();
+        unsigned queued{};
+        if(shared){
+            if(output){closeFallback();usedFallback=false;}
+            queued=gameOutput::stems.size();
+            if(queued>=gameOutput::fillGoal.load()){
+                WaitForSingleObject(gameOutput::demand,16);continue;
+            }
+        }else{
+            if(!output){
+                AcquireSRWLockExclusive(&voiceLock);
+                for(auto& voice:voices)if(voice.player)voice.player->setRoute(false);
+                ReleaseSRWLockExclusive(&voiceLock);
+                DWORD now=GetTickCount();
+                if(now-lastOpen<1000){Sleep(20);continue;}
+                lastOpen=now;
+                if(!openFallback()){Sleep(20);continue;}
+            }
+            if(headers[index].dwFlags&WHDR_INQUEUE){WaitForSingleObject(event,16);continue;}
+            for(auto& hdr:headers)if(hdr.dwFlags&WHDR_INQUEUE)queued+=frames;
+            if(logging && usedFallback && !queued)++queueUnderruns;
+        }
+        short world[2*frames]{},playerWet[2*frames]{};
+        float playerDry[2*frames]{};
+        const auto state=healthAudio::snapshot();
+        const bool protect=shared && gameOutput::hasSDK && !state.bypass && (state.amount>0.f || state.fade<1.f);
+        render<false>(world,steam[0],emit[0],field[0],queued,nullptr,false);
+        AcquireSRWLockShared(&voiceLock);
+        bool speechActive=std::any_of(std::begin(voices),std::end(voices),[](const Voice& v){return v.buffer && v.isPlayer;});
+        ReleaseSRWLockShared(&voiceLock);
+        if(speechActive){
+            float ms=std::max(1600.f,decayMs.load()*.0001f*decayPercent.load()*lowDecayPercent.load()+550.f);
+            tail=unsigned(std::min(ms,45000.f)*32);
+        }
+        if(speechActive || tail || speechRendering){
+            const bool clear=!speechActive && !tail;
+            render<true>(playerWet,steam[1],emit[1],field[1],queued,playerDry,protect,clear);
+            speechRendering=!clear;
+            if(!speechActive)tail-=std::min<unsigned>(tail,frames);
+        }
+        if(shared){
+            Stems packet[frames];
+            for(int i=0;i<frames;i++)for(int c=0;c<2;c++){
+                packet[i].world[c]=world[2*i+c]/32768.f;
+                packet[i].player[c]=playerWet[2*i+c]/32768.f+playerDry[2*i+c];
+            }
+            gameOutput::stems.push(packet,frames);
+        }else{
+            for(int i=0;i<frames*2;i++)
+                data[index][i]=short(std::clamp(int(world[i])+int(playerWet[i]),-32768,32767));
+            auto error=waveOutWrite(output,&headers[index],sizeof(WAVEHDR));
+            if(error!=MMSYSERR_NOERROR){outputError=error;closeFallback();usedFallback=false;continue;}
+            usedFallback=true;index=(index+1)%blocks;
+        }
     }
-    AcquireSRWLockExclusive(&voiceLock);
-    for (auto& v:voices) if (v.buffer) {v.buffer->Release();v={};}
-    ReleaseSRWLockExclusive(&voiceLock);
-    waveOutReset(output);
-    for (int i=0;i<prepared;i++) waveOutUnprepareHeader(output,&headers[i],sizeof(WAVEHDR));
-    waveOutClose(output);CloseHandle(event);return 0;
+
 }
 
 int option(const wchar_t* group,const wchar_t* key,int def,int high,const wchar_t* oldGroup=nullptr){
@@ -1738,6 +1868,12 @@ void writeStatus(bool force=false){
     std::fprintf(file,"  water enabled=%d listener=%.3f sources=%u radioFiltered=%d cutoffHz=%d lossDb=%d modulation=%d\n",
         int(waterEnabled),immersion::listener.load(),submerged,int(radioFiltered.load()),
         immersion::cutoff.load(),immersion::loss.load(),immersion::modulation.load());
+    auto injury=healthAudio::snapshot();
+    std::fprintf(file,"  lowHealth enabled=%d threshold=%d strength=%d amount=%.3f deathGain=%.3f bypass=%d outputMix=%d\n",
+        int(healthAudio::enabled.load()),healthAudio::threshold.load(),healthAudio::strength.load(),
+        injury.amount,injury.fade,int(injury.bypass),int(gameOutput::live()));
+    std::fprintf(file,"  injuryMix endpointHook=%d clients=%u packets=%u steamTail=%d stemUnderruns=%u\n",
+        int(gameOutput::hooked.load()),gameOutput::wrapped.load(),gameOutput::packets.load(),int(gameOutput::hasSDK.load()),gameOutput::underruns.load());
     std::fprintf(file,"  propagation materials=1 volumeSampling=1 routing=1 airAbsorption=1 directivity=1 directOcclusion=%d roomRadius=%.1f sourceRadius=%.1f fieldRadius=%d worldRange=%.2f speechRange=%.2f\n",
         int(directOcclusion),probeRadius,sourceRadius,fieldRadius.load(),rangeScale.load(),speechRangeScale.load());
     std::fprintf(file,"  mixer queueUnderruns=%u limitedBlocks=%u\n",queueUnderruns.load(),limitedBlocks.load());
@@ -1749,7 +1885,7 @@ void loadSettings(){
     if(logging && !wasLogging){
         logPath=iniPath.substr(0,iniPath.size()-4)+L".log";
         if(FILE* file=_wfopen(logPath.c_str(),L"w")){
-            std::fputs("Rebound.SA 0.59\nStatus every 5 seconds. Counters are cumulative for this game session.\n",file);
+            std::fputs("Rebound.SA 0.61\nStatus every 5 seconds. Counters are cumulative for this game session.\n",file);
             std::fclose(file);
         }
     }
@@ -1767,6 +1903,9 @@ void loadSettings(){
     probeRadius=float(std::max(40,option(L"Propagation",L"RoomProbeRadius",120,200)));
     sourceRadius=float(std::max(50,option(L"Propagation",L"SourceRadius",400,600)));
     waterEnabled=option(L"Underwater",L"Enabled",1,1);
+    healthAudio::enabled=option(L"LowHealth",L"Enabled",1,1);
+    healthAudio::threshold=std::max(10,option(L"LowHealth",L"ThresholdPercent",15,50));
+    healthAudio::strength=option(L"LowHealth",L"StrengthPercent",100,100);
     immersion::loss=option(L"Underwater",L"AttenuationDb",0,36);
     immersion::cutoff=std::max(100,option(L"Underwater",L"CutoffHz",420,3000));
     immersion::modulation=option(L"Underwater",L"ModulationPercent",12,35);
@@ -1817,6 +1956,14 @@ void frame() {
     DWORD now=GetTickCount();lastFrame=now;static DWORD last=now-100;
     bool paused=read<BYTE>(0xBA67A4)||read<BYTE>(0xB7CB48)||read<BYTE>(0xB7CB49);
     auto ped=paused?uintptr_t{}:reinterpret_cast<uintptr_t(__cdecl*)(int)>(0x56E210)(-1);
+    static injury::Life life;
+    unsigned playerIndex=read<BYTE>(0xB7CD74);
+    bool wasted=playerIndex<2 && read<BYTE>(0xB7CD98+0x190*playerIndex+0xdc)==1;
+    float screenAlpha=read<float>(0xB6F028+0xbfc);
+    float sfx=read<float>(audioHw+0x414)*read<float>(audioHw+0x41c);
+    healthAudio::master=std::isfinite(sfx)?std::clamp(sfx,0.f,1.f):0.f;
+    healthAudio::publish(life.update(ped!=0,ped?read<float>(ped+0x540):0.f,ped?read<float>(ped+0x544):0.f,
+        wasted,screenAlpha,healthAudio::threshold,healthAudio::strength,healthAudio::enabled,paused || healthAudio::excluded()));
     float targetWater=0;
     if(waterEnabled && ped){
         targetWater=read<float>(0xC8132C)>=.5f?1.f:0.f;
@@ -1857,6 +2004,15 @@ bool matches(uintptr_t addr,const char* sig,size_t size) {
     return VirtualQuery(p,&m,sizeof(m)) && m.State==MEM_COMMIT && !(m.Protect&(PAGE_NOACCESS|PAGE_GUARD))
         && !memcmp(p,sig,size);
 }
+using GameDeviceCreate=HRESULT(WINAPI*)(LPCGUID,IDirectSound**,IUnknown*);
+HRESULT WINAPI createGameDevice(LPCGUID device,IDirectSound** out,IUnknown* outer){
+    gameOutput::arm(iniPath.substr(0,iniPath.find_last_of(L"/\\")+1)+L"phonon.dll");
+    gameOutput::opening=true;
+    auto original=read<GameDeviceCreate>(0x85801c);
+    HRESULT h=original(device,out,outer);
+    gameOutput::opening=false;
+    return h;
+}
 void install(HMODULE mod) {
     pluginModule=mod;
     constexpr uintptr_t audio=0x4f10af, tick=0x53e981;
@@ -1888,6 +2044,16 @@ void install(HMODULE mod) {
         HMODULE pinned;
         if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,
                                reinterpret_cast<LPCWSTR>(mod),&pinned)) {
+            constexpr uintptr_t audioCreate=0x4d99f0;
+            if(matches(audioCreate,"\xff\x15\x1c\x80\x85\x00\x85\xc0",8)){
+                DWORD protection;auto* site=reinterpret_cast<BYTE*>(audioCreate);
+                if(VirtualProtect(site,6,PAGE_EXECUTE_READWRITE,&protection)){
+                    uint32_t rel=uintptr_t(createGameDevice)-(audioCreate+5);
+                    site[0]=0xe8;memcpy(site+1,&rel,4);site[5]=0x90;
+                    FlushInstructionCache(GetCurrentProcess(),site,6);
+                    VirtualProtect(site,6,protection,&tmp);
+                }
+            }
             constexpr uintptr_t volumeSite=0x4f041a;
             if(matches(volumeSite,"\xe8\xf1\xf5\xff\xff",5) && matches(0x4efa5c,"\xd8\x76\x18",3)){
                 DWORD old;

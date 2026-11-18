@@ -2,7 +2,7 @@
 #include "phonon.h"
 #include <cstring>
 
-// All calls, including destruction, run on the waveOut worker.
+// Each mixing path owns its effect and serializes processing and reset.
 struct SteamReturn {
     HMODULE dll{};
     IPLContext context{};
