@@ -59,6 +59,16 @@ struct SteamReturn {
         IPLAudioBuffer src{1,frames,&input},dst{1,frames,&output};
         apply(effect,&params,&src,&dst,nullptr);
     }
+    template<int Frames> void clear(bool newScene){
+        if(!effect)return;
+        reset(effect);
+        if(!newScene)return;
+        // In SDK 4.8.1 a reset can leave a short remnant in the parametric
+        // filters. Advance both filter banks with silence, then empty the delays.
+        float silence[Frames]{},discard[Frames];
+        for(int i=0;i<4;++i)process(silence,discard,Frames,.45f,0.f,0.f,1.f,1.f);
+        reset(effect);
+    }
     ~SteamReturn() {
         if (effect) releaseEffect(&effect);
         if (context) releaseContext(&context);

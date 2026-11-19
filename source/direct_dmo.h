@@ -5,7 +5,16 @@ namespace directfx {
 constexpr GUID cls={0x597def5e,0x678b,0x4808,{0x9d,0x28,0xae,0x79,0x24,0x36,0xf4,0x36}};
 constexpr GUID controlId={0xb4e10697,0xa0df,0x48e6,{0xb7,0x43,0x20,0xa9,0x88,0x9b,0xec,0x11}};
 constexpr int block=64;
-struct Controls {std::atomic<float> metres{};std::atomic<float> visibility{1.f};std::atomic<float> transmission[3]{{1.f},{1.f},{1.f}},air[3]{{1.f},{1.f},{1.f}};};
+struct Controls {
+    std::atomic<float> metres{},visibility{1.f};
+    std::atomic<float> transmission[3]{{1.f},{1.f},{1.f}},air[3]{{1.f},{1.f},{1.f}};
+    std::atomic<unsigned> generation{};
+    void neutral(){
+        metres=0.f;visibility=1.f;
+        for(int k=0;k<3;k++){transmission[k]=1.f;air[k]=1.f;}
+        ++generation;
+    }
+};
 Controls controls[64];
 std::atomic<bool> attached[64]{},waterAttached[64]{};
 HANDLE activation=INVALID_HANDLE_VALUE;
@@ -30,6 +39,7 @@ class Effect final: public IMediaObject, public IMediaObjectInPlace, public Cont
     std::unique_ptr<immersion::Stream> radio;
     AirPath atmosphere;float distance=0;
     bool counted=false,waterOnly=false;
+    unsigned generation{};
     HRESULT set(bool isInput,DWORD i,const DMO_MEDIA_TYPE* type,DWORD flags){
         if(i)return DMO_E_INVALIDSTREAMINDEX;
         auto& fmt=isInput?input:output;
@@ -96,6 +106,11 @@ public:
             else radio->process(reinterpret_cast<short*>(data),n,wet,ambient,flags==DMO_INPLACE_ZERO);
             streamWet=!ambient && wet>.005f;
             return S_OK;
+        }
+        const unsigned nextGeneration=controls[slot].generation.load();
+        if(nextGeneration!=generation){
+            Flush();
+            generation=nextGeneration;
         }
         if(!counted && !waterOnly){
             const auto& control=controls[slot];

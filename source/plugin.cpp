@@ -22,6 +22,8 @@
 #include "room.h"
 #include "acoustics.h"
 #include "space.h"
+#include "return_diffusion.h"
+#include "transient_audio.h"
 #include "voice_response.h"
 #include "steam_return.h"
 #include <string>
@@ -118,6 +120,7 @@ std::array<std::array<float,64>,2> retiredField{};
 std::array<std::array<float,4>,2> retiredBus{}; // Protected by voiceLock.
 SRWLOCK voiceLock=SRWLOCK_INIT;
 std::atomic<int> enclosure{-1};
+std::atomic<unsigned> sceneGeneration{};
 std::atomic<bool> ready{false};
 std::atomic<float> lateralReturn[2]{},lateralRange[2]{{30.f},{30.f}};
 std::atomic<DWORD> lastFrame{0};
@@ -136,11 +139,12 @@ bool directOcclusion=true;
 struct EmitterGeometry {
     uintptr_t owner{};
     Vec position{};
-    bool door{};
+    bool door{},floorImpact{};
 };
 thread_local const EmitterGeometry* tracingEmitter{};
+thread_local bool tracingDirect{};
 struct TraceScope {
-    explicit TraceScope(const EmitterGeometry& source){tracingEmitter=&source;}
+    explicit TraceScope(const EmitterGeometry& source){tracingEmitter=&source;tracingDirect=true;}
     ~TraceScope(){tracingEmitter=nullptr;}
 };
 bool castRay(Vec a,Vec b,Hit& hit,void*& entity){
@@ -148,6 +152,7 @@ bool castRay(Vec a,Vec b,Hit& hit,void*& entity){
     if(!cast(a,b,hit,entity,true,false,false,true,true,false,false,false))return false;
     if(!tracingEmitter || !entity)return true;
     const auto& source=*tracingEmitter;
+    if(tracingDirect && source.floorImpact && contactFloor(a,b,source.position,hit.point,hit.normal))return false;
     bool self=uintptr_t(entity)==source.owner;
     if(!self && source.door && hit.material==50){
         Vec delta{hit.point.x-source.position.x,hit.point.y-source.position.y,hit.point.z-source.position.z};
@@ -223,6 +228,8 @@ float depthAt(Vec p){
     return hit?std::clamp((surface-p.z-.12f)/.6f,0.f,1.f):0.f;
 }
 constexpr uintptr_t hardware=0xB5F8B8;
+struct WaterSourceCache {uintptr_t owner{};DWORD sampled{};};
+WaterSourceCache waterSources[64];
 bool radioHook{};
 uintptr_t playerPed{};
 std::wstring pluginDirectory(){return iniPath.substr(0,iniPath.find_last_of(L"/\\")+1);}
@@ -246,6 +253,8 @@ std::atomic<float> wetEq[2][3];
 std::atomic<bool> wallEcho{true},lateReverb{true};
 std::atomic<float> cityReturn{},openSky{},streetGain{},streetBoost{1.58f},rangeScale{2.f};
 std::atomic<float> speechRangeScale{1.f};
+constexpr unsigned entryExitDoor=0xA3;
+bool transitionLayout{};
 bool isPedSpeech(short bank,unsigned event){
     return (bank>=20 && bank<=25) || event==0x34 || event==0x35;
 }
@@ -253,9 +262,17 @@ bool isPedSpeech(short bank,unsigned event){
 void __fastcall calculateWorldVolume(uintptr_t sound,void*){
     auto& distanceScale=*reinterpret_cast<float*>(sound+0x18);
     float original=distanceScale;
-    float scale=isPedSpeech(read<short>(sound),read<unsigned>(sound+0xc))
+    const unsigned event=read<unsigned>(sound+0xc);
+    float scale=isPedSpeech(read<short>(sound),event)
               ? speechRangeScale.load() : rangeScale.load();
-    bool extend=!(read<unsigned short>(sound+0x56)&65) && original>0 && std::isfinite(original*scale) && scale!=1.f;
+    const bool world=!(read<unsigned short>(sound+0x56)&65);
+    if(world && event==entryExitDoor && playerPed && transitionLayout && read<uintptr_t>(0x96A7D4)){
+        Vec pos=read<Vec>(sound+0x24),player{},relative{};
+        reinterpret_cast<void(__cdecl*)(Vec*,int)>(0x56E010)(&player,-1);
+        reinterpret_cast<void(__cdecl*)(Vec*,const Vec*)>(0x4D80B0)(&relative,&pos);
+        scale*=doorwayRollOff(magnitude(difference(player,pos)),magnitude(relative));
+    }
+    bool extend=world && original>0 && std::isfinite(original*scale) && scale!=1.f;
     if(extend)distanceScale=original*scale;
     reinterpret_cast<void(__thiscall*)(uintptr_t)>(0x4efa10)(sound);
     if(extend)distanceScale=original;
@@ -517,7 +534,9 @@ HRESULT createNativeBuffer(IDirectSound* ds,const DSBUFFERDESC* original,IDirect
         if(read<uintptr_t>(hardware+0xe64+4*j)+8==uintptr_t(out)){
             physical=j;
             directfx::attached[j]=false;directfx::waterAttached[j]=false;
-            immersion::drowning[j]=false;immersion::source[j]=0;break;
+            immersion::drowning[j]=false;immersion::source[j]=0;
+            if(GetCurrentThreadId()==gameThread)waterSources[j]={};
+            break;
         }
     }
     if(!(original->dwFlags&DSBCAPS_CTRL3D) || slot<0){
@@ -603,7 +622,6 @@ struct Source {
     bool haveVisible{}, haveRoute{};
     DWORD seen{};
 };
-constexpr unsigned entryExitDoor=0xa3;
 std::atomic<bool> engineVoice[64]{};
 // CVehicle::m_vehicleAudio and its twelve engine CAESound pointers (SA 1.0).
 // Game-thread only. Each pool supplies an allocation bitmap indexed by slot.
@@ -684,35 +702,18 @@ void __fastcall sourceVolume(uintptr_t hw,void*,int base,int index,float db,int 
             personal=context==357 || context==341;
         }
         immersion::drowning[physical]=personal;
-        static DWORD sampled[64]{};
-        static uintptr_t previous[64]{};
-        uintptr_t owner=id>=0 && id<300 && !(read<unsigned short>(sound+0x56)&65)?read<uintptr_t>(sound+8):0;
-        if(!owner && id>=0 && id<300 && !(read<unsigned short>(sound+0x56)&65)){
-            auto audio=read<uintptr_t>(sound+4);if(audio)owner=read<uintptr_t>(audio+4);
-        }
-        
-        if(!waterEnabled || !livePhysical(owner) || !(read<BYTE>(owner+0x41)&1)){
-            immersion::source[physical]=0;previous[physical]=0;
-        }else if(owner!=previous[physical] || GetTickCount()-sampled[physical]>=100){
-            immersion::source[physical]=depthAt(read<Vec>(sound+0x24));
-            sampled[physical]=GetTickCount();previous[physical]=owner;
-        }
+
         if (enclosure.load()<0 || id<0 || id>=300 || (read<unsigned short>(sound+0x56)&65)) {
+            if(src.id>=0)directfx::controls[physical].neutral();
             src={};
-            directfx::controls[physical].metres=0;
-            directfx::controls[physical].visibility=1.f;
-            if(directfx::attached[physical])for(int k=0;k<3;k++){
-                directfx::controls[physical].air[k]=1.f;directfx::controls[physical].transmission[k]=1.f;
-            }
         } else {
             DWORD now=GetTickCount();
             bool starting=src.id!=id || uintptr_t(__builtin_return_address(0))==volumeCalls[0]+5;
             if (starting) { src={};
+                directfx::controls[physical].neutral();
                 entranceAccess[physical]=0;
                 outdoorAudible[physical]=0;wallPanOffset[physical]=0;tunnelConnection[physical]=0;
                 emitterRoofPercent[physical]=0;
-                directfx::controls[physical].visibility=1.f;
-                for(int k=0;k<3;k++){directfx::controls[physical].transmission[k]=1.f;directfx::controls[physical].air[k]=1.f;}
                 AcquireSRWLockExclusive(&sceneLock);sceneView.paths[physical]={};ReleaseSRWLockExclusive(&sceneLock);
                 wallEq[physical]=0;farReturn[physical]=0;src.id=id;src.checked=now-180;src.send=roofWeight>.5f?.15f:1.f; }
             src.pos=read<Vec>(sound+0x24);
@@ -737,7 +738,8 @@ void __fastcall sourceVolume(uintptr_t hw,void*,int base,int index,float db,int 
                 for(auto& band:ctrl.transmission)band=1.f;
             }
             if(!owner && audioOwner)owner=read<uintptr_t>(audioOwner+4);
-            src.geometry={panel?panel->entity:owner,src.pos,bank==31 || (event>=0x9f && event<=entryExitDoor) || event==0x13e || event==0x13f};
+            src.geometry={panel?panel->entity:owner,src.pos,bank==31 || (event>=0x9f && event<=entryExitDoor) || event==0x13e || event==0x13f,
+                          bank==2 && audioOwner==0xB6BC90+0x4BC && (read<unsigned short>(sound+0x56)&0x420)==0x420};
             if(starting && event!=entryExitDoor && directOcclusion && enclosure>=0){
                 // The first playback volume can precede the next budgeted spatial update.
                 static DWORD lastTick{};static unsigned checks{};
@@ -798,6 +800,18 @@ void __fastcall sourceVolume(uintptr_t hw,void*,int base,int index,float db,int 
                 db=applied;
             }else losses[physical]=0;
         }
+        auto& water=waterSources[physical];
+        uintptr_t owner=id>=0 && id<300 && !(read<unsigned short>(sound+0x56)&65)?read<uintptr_t>(sound+8):0;
+        if(!owner && id>=0 && id<300 && !(read<unsigned short>(sound+0x56)&65)){
+            auto audio=read<uintptr_t>(sound+4);if(audio)owner=read<uintptr_t>(audio+4);
+        }
+        
+        if(!waterEnabled || !livePhysical(owner) || !(read<BYTE>(owner+0x41)&1)){
+            immersion::source[physical]=0;water.owner=0;
+        }else if(owner!=water.owner || GetTickCount()-water.sampled>=100){
+            immersion::source[physical]=depthAt(read<Vec>(sound+0x24));
+            water.sampled=GetTickCount();water.owner=owner;
+        }
         spatialVoice[physical]=src.id>=0;
         sourceRoom[physical]=int(src.roomSend*1000);
         if(src.id<0){losses[physical]=0;engineVoice[physical]=false;wallEq[physical]=0;}
@@ -810,11 +824,13 @@ void __fastcall sourceVolume(uintptr_t hw,void*,int base,int index,float db,int 
 
 // Collision queries run once the main game update has returned. Audio
 // callbacks only copy the current position and consume the cached result.
+unsigned trailCount{};
 void updateSources(DWORD now) {
     static unsigned next=0;
     // Recent listener positions supply actual points inside passages of arbitrary orientation.
     static Vec trail[16]{};
-    static unsigned head=0,count=0;
+    static unsigned head=0;
+    unsigned& count=trailCount;
     auto separation=[](Vec a,Vec b){return magnitude({a.x-b.x,a.y-b.y,a.z-b.z});};
     float moved=count?separation(listener,trail[(head+15)%16]):1000.f;
     if(moved>45)count=0;
@@ -859,8 +875,9 @@ void updateSources(DWORD now) {
         else {
             auto trace=[&](Vec o,Vec dir,float range){--budget;return distance(o,dir,range);};
             float transmitted=.035f, highRatio=1.f;
+            const float emitterRadius=src.geometry.floorImpact?.14f:.85f;
             if(src.event==entryExitDoor){src.shadow=0.f;}else if(live::started && metres>.05f){
-                auto result=live::query(pos,metres>1.5f,budget);
+                auto result=live::query(pos,metres>1.5f,emitterRadius,budget);
                 visibility=sdkGain(result.occlusion);
                 src.shadow=1.f-visibility;
                 transmitted=std::clamp((result.transmission[0]+result.transmission[1]+result.transmission[2])/3.f,.001f,1.f);
@@ -875,14 +892,15 @@ void updateSources(DWORD now) {
                 Vec up{-side.y*d.z/metres,side.x*d.z/metres,xy/metres};
                 int blocked=0;
                 for(auto uv : {std::pair<float,float>{0,0},{1,0},{-1,0},{0,1},{0,-1}}){
-                    Vec ray{d.x+.85f*(side.x*uv.first+up.x*uv.second),
-                            d.y+.85f*(side.y*uv.first+up.y*uv.second),
-                            d.z+.85f*up.z*uv.second};
+                    Vec ray{d.x+emitterRadius*(side.x*uv.first+up.x*uv.second),
+                            d.y+emitterRadius*(side.y*uv.first+up.y*uv.second),
+                            d.z+emitterRadius*up.z*uv.second};
                     float len=magnitude(ray);
                     blocked+=trace(listener,{ray.x/len,ray.y/len,ray.z/len},len)<len-.06f;
                 }
                 src.shadow=blocked*.2f;
             } else src.shadow=obstruction(listener,pos,trace);
+            tracingDirect=false; // Subsequent rays measure the surrounding geometry.
             if(src.shadow==0.f){src.haveVisible=true;src.lastVisible=listener;}
             Vec right=read<Vec>(0xB6F028+0x974);
             src.pan=std::clamp((d.x*right.x+d.y*right.y+d.z*right.z)/std::max(metres,1.f),-1.f,1.f);
@@ -1417,10 +1435,15 @@ void render(short* out,SteamReturn& steam,SteamReturn (&emit)[2], SoundField& fi
     float input[frames]{},stereoSide[frames]{};
     int state=retire || GetTickCount()-lastFrame.load()>1500 ? -1 : enclosure.load();
     static float early[2][16384]{},wallGain[2]{},farMix[2]{},axialMix=0,covered=0,diffuse=0;
+    static ReturnDiffusion diffusion[2];
     static ReflectionTone tone[2][2];
     static DirectTone equalizer[2][2];
     static bool eqReady=false;
     if(!eqReady){for(auto& bus:equalizer)for(auto& eq:bus)eq.configure(Room::rate);eqReady=true;}
+    static unsigned lastScene{};
+    const unsigned generation=sceneGeneration.load();
+    const bool resetScene=generation!=lastScene;
+    lastScene=generation;
     const float hall=largeRoomAmount.load();
     float settings[2][3];static float smooth[2][3]={{1,1,1},{1,1,1}};
     for(int b=0;b<2;b++)for(int k=0;k<3;k++){
@@ -1441,9 +1464,49 @@ void render(short* out,SteamReturn& steam,SteamReturn (&emit)[2], SoundField& fi
     SceneView view;
     AcquireSRWLockShared(&sceneLock);view=sceneView;ReleaseSRWLockShared(&sceneLock);
     static float blend=0.f;
+    static float decayEnvelope=450.f, bassReturn[2]{};
+    static bool silent=false;
+    static float low[2][2]{},hallBass[2]{};
+    static float lateLow[2]{};
+    static Room emitterFallback[2];
+    static int lastStretch=100,lastEchoDelay=0,lastPreDelay=0;
+    static float delayed[2][2][8192]{};
+    static unsigned delayHead=0;
+    static float taps[2][8192]{};static unsigned tapHead=0;
+    static float soft=0,enclosedMix=0,corridorMix=0;
+    static float sizeMix=0,skyBlend=0,urbanGain=1,city=0;
+    if(resetScene || (state<0 && !silent)){
+        for(auto& channel:diffusion)channel={};
+        listenerWater[Player].clear();
+        std::memset(low,0,sizeof low);
+        std::fill_n(hallBass,2,0.f);
+        std::memset(delayed,0,sizeof delayed);
+        std::memset(taps,0,sizeof taps);
+        std::memset(queue.stereo,0,sizeof queue.stereo);
+        steam.clear<frames>(resetScene);
+        for(auto& e:emit)e.clear<frames>(resetScene);
+        for(auto& r:emitterFallback)r.clear();
+        for(auto& ch:early)std::fill_n(ch,16384,0.f);
+        for(auto& bus:tone)for(auto& f:bus)f={};
+        for(auto& bus:equalizer)for(auto& f:bus)f.clear();
+        room.clear();longRoom.clear();limiter={};
+        covered=diffuse=blend=level=0;
+        std::fill_n(lateLow,2,0.f);
+        std::fill_n(bassReturn,2,0.f);
+        decayEnvelope=450.f;
+        if(resetScene){
+            std::memset(field.previous,0,sizeof field.previous);
+            if constexpr(!Player)for(auto& filter:emitterWater)filter.clear();
+            if(field.available)field.resetDecoder(field.dec);
+            std::fill_n(wallGain,2,0.f);std::fill_n(farMix,2,0.f);
+            soft=axialMix=enclosedMix=corridorMix=sizeMix=skyBlend=city=0.f;
+            urbanGain=1.f;
+        }
+    }
+    silent=state<0;
     bool enabled=useField.load(), spatial=state>=0 && field.available && (enabled || blend>0.f);
     static bool previousSpatial=false;
-    if(!spatial && previousSpatial)field.resetDecoder(field.dec);
+    if(!spatial && previousSpatial && !resetScene)field.resetDecoder(field.dec);
     previousSpatial=spatial;
     if(spatial)std::memset(field.mix,0,sizeof(field.mix));
     MixBuses buses{input,stereoSide,roomIn,nullptr};
@@ -1492,42 +1555,10 @@ void render(short* out,SteamReturn& steam,SteamReturn (&emit)[2], SoundField& fi
         }
         field.spatialize(roomIn,view,enabled?1.f:0.f,blend);
     }
-    static float decayEnvelope=450.f, bassReturn[2]{};
-    static bool silent=false;
-    static float low[2][2]{},hallBass[2]{};
-    static float lateLow[2]{};
-    static Room emitterFallback[2];
-    static int lastStretch=100,lastEchoDelay=0,lastPreDelay=0;
-    static float delayed[2][2][8192]{};
-    static unsigned delayHead=0;
-    static float taps[2][8192]{};static unsigned tapHead=0;
-    if (state<0) {
-        if(!silent){
-            listenerWater[Player].clear();
-            std::memset(low,0,sizeof low);
-            std::fill_n(hallBass,2,0.f);
-            std::memset(delayed,0,sizeof delayed);
-            std::memset(taps,0,sizeof taps);
-            std::memset(queue.stereo,0,sizeof queue.stereo);
-            if(steam.effect)steam.reset(steam.effect);
-            for(auto& e:emit)if(e.effect)e.reset(e.effect);
-            for(auto& r:emitterFallback)r.clear();
-            for(auto& ch:early)std::fill_n(ch,16384,0.f);
-            for(auto& bus:tone)for(auto& f:bus)f={};
-            for(auto& bus:equalizer)for(auto& f:bus)f.clear();
-            room.clear();longRoom.clear();limiter={};
-            covered=diffuse=blend=level=0;
-            std::fill_n(lateLow,2,0.f);
-            std::fill_n(bassReturn,2,0.f);
-            decayEnvelope=450.f;silent=true;
-        }
-        std::fill_n(out,frames*2,0);return;
-    }
-    silent=false;
+    if(state<0){std::fill_n(out,frames*2,0);return;}
     float diffuseTarget=diffusionPercent.load()*.01f;
     float coverTarget=coverPercent.load()*.01f;
     float axialTarget=std::clamp((spanMetres.load()-24)/82.f,0.f,1.f);
-    static float soft=0;
     soft+=.04f*(materialPercent.load()*.01f-soft);
     float high=reflectedHigh.load()*(1.f-.58f*soft);
     // One update per 8 ms block. Let energy stored under the roof ring out at the exit.
@@ -1539,7 +1570,6 @@ void render(short* out,SteamReturn& steam,SteamReturn (&emit)[2], SoundField& fi
     int decay=int(decayEnvelope);
     room.setDecay(int(duration*std::min(decay,1050)));
     if(!steam.effect)longRoom.setDecay(int(duration*decay));
-    static float enclosedMix=0,corridorMix=0;
     enclosedMix+=.045f*(enclosedAmount.load()-enclosedMix);
     corridorMix+=.045f*(corridorAmount.load()-corridorMix);
     float emitterSeconds=duration*(std::max(1.65f,neighbouringDecay.load())*(1.f-enclosedMix)+enclosedMix*decayEnvelope*.001f);
@@ -1552,7 +1582,6 @@ void render(short* out,SteamReturn& steam,SteamReturn (&emit)[2], SoundField& fi
         float old=read(lastStretch);
         return old+(current-old)*float(i+1)/frames;
     };
-    static float sizeMix=0,skyBlend=0,urbanGain=1,city=0;
     city+=.045f*(cityReturn.load()-city);
     skyBlend+=.1f*(openSky.load()-skyBlend);
     urbanGain+=.05f*(1.f+streetGain.load()*(streetBoost.load()-1.f)-urbanGain);
@@ -1655,7 +1684,9 @@ void render(short* out,SteamReturn& steam,SteamReturn (&emit)[2], SoundField& fi
         };
         float earlySample=delayedSample(0,echo[at],echoOffset,lastEchoDelay);
         float lateSample=delayedSample(1,wetBlock[at],lateOffset,lastPreDelay);
-        wetBlock[at]=echoEnabled*equalizer[0][ch].sample(earlySample,settings[0])+reverbEnabled*urbanGain*equalizer[1][ch].sample(lateSample,settings[1]);
+        float reflected=diffusion[ch].echo(equalizer[0][ch].sample(earlySample,settings[0]));
+        float tail=equalizer[1][ch].sample(lateSample,settings[1]);
+        wetBlock[at]=echoEnabled*reflected+reverbEnabled*urbanGain*tail;
     }
     }
     lastStretch=stretch;lastEchoDelay=echoOffset;lastPreDelay=lateOffset;
@@ -1738,6 +1769,7 @@ DWORD WINAPI worker(void*) {
         }
         short world[2*frames]{},playerWet[2*frames]{};
         float playerDry[2*frames]{};
+        const unsigned generation=sceneGeneration.load();
         const auto state=healthAudio::snapshot();
         const bool protect=shared && gameOutput::hasSDK && !state.bypass && (state.amount>0.f || state.fade<1.f);
         render<false>(world,steam[0],emit[0],field[0],queued,nullptr,false);
@@ -1754,6 +1786,7 @@ DWORD WINAPI worker(void*) {
             speechRendering=!clear;
             if(!speechActive)tail-=std::min<unsigned>(tail,frames);
         }
+        if(generation!=sceneGeneration.load())continue;
         if(shared){
             Stems packet[frames];
             for(int i=0;i<frames;i++)for(int c=0;c<2;c++){
@@ -1867,7 +1900,7 @@ void loadSettings(){
     if(logging && !wasLogging){
         logPath=iniPath.substr(0,iniPath.size()-4)+L".log";
         if(FILE* file=_wfopen(logPath.c_str(),L"w")){
-            std::fputs("Rebound.SA 0.65\nStatus every 5 seconds. Counters are cumulative for this game session.\n",file);
+            std::fputs("Rebound.SA 0.67\nStatus every 5 seconds. Counters are cumulative for this game session.\n",file);
             std::fclose(file);
         }
     }
@@ -1922,6 +1955,80 @@ void loadSettings(){
     reloadKey=std::max(1,option(L"Controls",L"ReloadKey",119,254));
     writeStatus(true);
 }
+injury::Life life;
+bool wasDead{};
+DoorMotions doorMotion;
+bool warmBanks{};
+constexpr int collisionBank=39,doorBank=51,collisionSlot=2,doorSlot=31;
+bool bankReady(int bank,int slot){
+    return reinterpret_cast<bool(__thiscall*)(uintptr_t,int,int)>(0x4D88C0)(hardware,bank,slot);
+}
+void requestBank(int bank,int slot){
+    reinterpret_cast<void(__thiscall*)(uintptr_t,int,int)>(0x4D88A0)(hardware,bank,slot);
+}
+void serviceDoor(int area,DWORD tick){
+    doorMotion.service(area,tick,[]{return bankReady(doorBank,doorSlot);},[](Vec position){
+        // Use the native bank, variation, position and distance curve.
+        using PlayDoor=void(__thiscall*)(uintptr_t,short,unsigned,const Vec&,float,float);
+        reinterpret_cast<PlayDoor>(0x4DC6D0)(0xB6BC90+0x1F50,1,entryExitDoor,position,0.f,1.f);
+    });
+}
+void __fastcall entryDoorMovement(uintptr_t audio,void*,unsigned event,uintptr_t leaf){
+    if(audio!=0xB6BC90+0x1F50 || event!=entryExitDoor || !leaf){
+        if(leaf)reinterpret_cast<void(__thiscall*)(uintptr_t,unsigned,uintptr_t)>(0x4DC9F0)(audio,event,leaf);
+        return;
+    }
+    uintptr_t matrix=read<uintptr_t>(leaf+0x14);
+    Vec position=read<Vec>(matrix?matrix+0x30:leaf+4);
+    const int area=read<int>(0xB72914);
+    const DWORD tick=read<DWORD>(0xB7CB84);
+    Vec player{};
+    if(playerPed)reinterpret_cast<void(__cdecl*)(Vec*,int)>(0x56E010)(&player,-1);
+    bool nearby=playerPed && magnitude(difference(position,player))<8.f;
+    if(doorMotion.movement(leaf,area,position,nearby,tick) && !bankReady(doorBank,doorSlot)){
+        if(read<BYTE>(hardware+1))warmBanks=true;
+        else requestBank(doorBank,doorSlot);
+    }
+    serviceDoor(area,tick);
+}
+
+void __fastcall restartSoundEffects(uintptr_t engine,void*){
+    // CGame::InitialiseWhenRestarting calls this after the save has loaded and
+    // before AudioEngine.Restart. Pause/resume never enters this call site.
+    enclosure=-1;playerPed=0;earValid=false;changingSeat=false;
+    reinterpret_cast<void(__thiscall*)(uintptr_t)>(0x507C30)(engine);
+    immersion::listener=0;life={};wasDead=false;concussion.clear();
+    healthAudio::stateWord=0;++healthAudio::stateVersion;
+    doorMotion={};trailCount=0;roofWeight=listenerSurface=listenerCeiling=0;
+    std::fill_n(neighbours,32,NearbySpace{});
+    std::fill_n(panels,16,DoorPanel{});
+    const int channelCount=std::min(64,int(read<unsigned short>(hardware+0x8e)));
+    AcquireSRWLockExclusive(&voiceLock);
+    for(int i=0;i<64;++i){
+        auto& v=voices[i];
+        if(v.buffer){v.buffer->Release();v={};}
+        sources[i]={};losses[i]=sends[i]=pans[i]=shadows[i]=0;
+        airDistance[i]=wallEq[i]=emissionDb[i]=sourceRoom[i]=farReturn[i]=0;
+        spatialVoice[i]=0;engineVoice[i]=ambientVoice[i]=speech[i]=healthAudio::cjVoice[i]=false;
+        entranceAccess[i]=outdoorAudible[i]=wallPanOffset[i]=tunnelConnection[i]=surfaceWeight[i]=0.f;
+        emitterRoofPercent[i]=0;
+        waterSources[i]={};immersion::source[i]=0.f;immersion::drowning[i]=false;
+        directfx::controls[i].neutral();
+    }
+    retiredField={};retiredBus={};
+    ++sceneGeneration;
+    ReleaseSRWLockExclusive(&voiceLock);
+    AcquireSRWLockExclusive(&sceneLock);sceneView=SceneView{};ReleaseSRWLockExclusive(&sceneLock);
+    // Attachment flags describe a real buffer and are replaced on allocation.
+    for(int i=0;i<64;++i){
+        if(!waterCopies[i].active())continue;
+        auto channel=i<channelCount?read<uintptr_t>(hardware+0xE64+4*i):0;
+        if(channel && channel!=read<uintptr_t>(hardware+0xE10))
+            waterCopies[i].restore(read<IDirectSoundBuffer*>(channel+8),read<uintptr_t>(channel+0x84));
+        else waterCopies[i].forget();
+    }
+    warmBanks=true;
+}
 void frame() {
     gameThread=GetCurrentThreadId();
     priorFrame();
@@ -1945,7 +2052,7 @@ void frame() {
     DWORD now=GetTickCount();lastFrame=now;static DWORD last=now-100;
     bool paused=read<BYTE>(0xBA67A4)||read<BYTE>(0xB7CB48)||read<BYTE>(0xB7CB49);
     auto ped=paused?uintptr_t{}:reinterpret_cast<uintptr_t(__cdecl*)(int)>(0x56E210)(-1);
-    static injury::Life life;
+
     unsigned playerIndex=read<BYTE>(0xB7CD74);
     bool wasted=playerIndex<2 && read<BYTE>(0xB7CD98+0x190*playerIndex+0xdc)==1;
     float screenAlpha=read<float>(0xB6F028+0xbfc);
@@ -1953,7 +2060,7 @@ void frame() {
     healthAudio::master=std::isfinite(sfx)?std::clamp(sfx,0.f,1.f):0.f;
     const bool excluded=paused || healthAudio::excluded();
     const float hp=ped?read<float>(ped+0x540):0.f;
-    static bool wasDead=false;
+
     if(!paused){
         if((ped && concussion.owner!=ped) || (wasDead && ped && hp>0 && !wasted) || excluded)concussion.clear();
         wasDead=wasted || (ped && hp<=0);
@@ -1977,12 +2084,22 @@ void frame() {
     immersion::listener=targetWater;
     refreshStaticWater();
     currentArea=read<int>(0xB72914);
+    if(!paused && ped){
+        // The loader discards bank requests while effects loading is disabled.
+        // Wait for the first gameplay frame that can actually enqueue them.
+        if(warmBanks && !read<BYTE>(hardware+1)){
+            if(!bankReady(collisionBank,collisionSlot))requestBank(collisionBank,collisionSlot);
+            if(!bankReady(doorBank,doorSlot))requestBank(doorBank,doorSlot);
+            warmBanks=false;
+        }
+        serviceDoor(currentArea,read<DWORD>(0xB7CB84));
+    }
     stadiumActive=ped && inStadium(currentArea,now);
     if ((!interiors && currentArea!=0 && !stadiumActive) || !ped) {
         enclosure=-1;earValid=false;last=now-100;writeStatus();return;
     }
     if(alternativePitch)updateEar();
-    if (now-last>=100) {
+    if (enclosure.load()<0 || now-last>=100) {
         last=now;enclosure=measure();
     }
     {
@@ -2057,6 +2174,24 @@ void install(HMODULE mod) {
                     VirtualProtect(page,delayed+5-first,saved,&tmp);explosionHooks=true;
                 }
             }
+            auto replaceCall=[&](uintptr_t site,uintptr_t target){
+                DWORD protection;
+                auto* instruction=reinterpret_cast<BYTE*>(site);
+                if(!VirtualProtect(instruction,5,PAGE_EXECUTE_READWRITE,&protection))return;
+                uint32_t rel=target-(site+5);
+                memcpy(instruction+1,&rel,4);
+                FlushInstructionCache(GetCurrentProcess(),instruction,5);
+                VirtualProtect(instruction,5,protection,&tmp);
+            };
+            // Independent optional fixes, restricted to verified native layouts.
+            transitionLayout=matches(0x440F79,"\x8b\x0d\xd4\xa7\x96\x00",6);
+            if(matches(0x53C78E,"\xe8\x9d\xb4\xfc\xff\xb9\x90\xbc\xb6\x00",10) &&
+               matches(0x4DA050,"\x6a\x02\x6a\x27",4) && matches(0x4DC6F9,"\x6a\x1f\x6a\x33",4))
+                replaceCall(0x53C78E,uintptr_t(restartSoundEffects));
+            if(matches(0x506F5A,"\x81\xc1\x50\x1f\x00\x00\xe8\x8b\x5a\xfd\xff",11) &&
+               matches(0x4DCA48,"\x6a\x01\x8b\xce\xe8\x7f\xfc\xff\xff",9) &&
+               matches(0x4DC6F9,"\x6a\x1f\x6a\x33",4))
+                replaceCall(0x506F60,uintptr_t(entryDoorMovement));
             constexpr uintptr_t audioCreate=0x4d99f0;
             if(matches(audioCreate,"\xff\x15\x1c\x80\x85\x00\x85\xc0",8)){
                 DWORD protection;auto* site=reinterpret_cast<BYTE*>(audioCreate);

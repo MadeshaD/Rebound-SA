@@ -96,11 +96,11 @@ bool start(const std::wstring& path){
 IPLCoordinateSpace3 space(Vec v){
     IPLCoordinateSpace3 c{};c.right={1,0,0};c.up={0,0,1};c.ahead={0,1,0};c.origin={v.x,v.y,v.z};return c;
 }
-IPLDirectEffectParams query(Vec emitter,bool volumetric,int& budget){
+IPLDirectEffectParams query(Vec emitter,bool volumetric,float radius,int& budget){
     IPLSimulationInputs in{};in.flags=IPL_SIMULATIONFLAGS_DIRECT;
     in.directFlags=static_cast<IPLDirectSimulationFlags>(IPL_DIRECTSIMULATIONFLAGS_OCCLUSION|IPL_DIRECTSIMULATIONFLAGS_TRANSMISSION);
     in.source=space(emitter);in.occlusionType=volumetric?IPL_OCCLUSIONTYPE_VOLUMETRIC:IPL_OCCLUSIONTYPE_RAYCAST;
-    in.occlusionRadius=.85f;in.numOcclusionSamples=5;in.numTransmissionRays=2;
+    in.occlusionRadius=radius;in.numOcclusionSamples=5;in.numTransmissionRays=2;
     IPLSimulationSharedInputs shared{};shared.listener=space(listener);
     remaining=&budget;
     SimulatorSetSharedInputs(sim,in.flags,&shared);SourceSetInputs(source,in.flags,&in);

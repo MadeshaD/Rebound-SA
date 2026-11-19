@@ -22,6 +22,13 @@ class StaticWater {
     }
 public:
     ~StaticWater(){forget();}
+    bool active()const{return owner!=nullptr;}
+    void restore(IDirectSoundBuffer* buffer,uintptr_t soundBank){
+        // At restart a bank can already have been rebound. Never write an old
+        // snapshot into a different sound. A failed lock can be retried by update().
+        if(owner && owner==buffer && bank==soundBank)update(buffer,soundBank,{});
+        else forget();
+    }
     void forget(){
         if(!owner)return;
         owner->Release();

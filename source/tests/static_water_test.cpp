@@ -72,6 +72,13 @@ int main(){
     std::fill(buffer.pcm.begin(),buffer.pcm.end(),1200);const auto other=buffer.pcm;
     state.update(&buffer,2,under);state.update(&buffer,2,off);
     assert(buffer.pcm==other && buffer.refs==1 && !locks);
+    // Restart restores a surviving native buffer and leaves a rebound bank alone.
+    state.update(&buffer,2,under);assert(state.active());
+    buffer.failNext=true;state.restore(&buffer,2);assert(state.active());
+    state.restore(&buffer,2);assert(!state.active() && buffer.pcm==other);
+    state.update(&buffer,2,under);
+    std::fill(buffer.pcm.begin(),buffer.pcm.end(),700);const auto rebound=buffer.pcm;
+    state.restore(&buffer,3);assert(!state.active() && buffer.pcm==rebound);
     iplContextRelease(&context);
     std::puts("Split PCM locks, exact restoration, retry, bank reuse and cached partial immersion passed.");
 }
